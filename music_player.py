@@ -11,11 +11,19 @@ import numpy as np
 import io
 from io import BytesIO
 import json
+import ctypes
+from urllib import parse
+import random
+import soco
+import socket
 from pathlib import Path
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from functools import partial  # 用于绑定参数
+import threading
 from PyQt5.QtWidgets import (QApplication, QLineEdit, QWidget, QCheckBox, 
                             QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, 
                             QLabel, QFileDialog, QMessageBox, QProgressBar, 
-                            QGraphicsDropShadowEffect,QSplitter)
+                            QGraphicsDropShadowEffect, QSplitter, QAbstractItemView,QComboBox)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
 from PyQt5.QtGui import QColor,QPixmap, QIcon
 import keyboard
@@ -36,6 +44,8 @@ class MusicPlayer(QWidget):
     # 自定义信号，用于更新UI
     update_ui_signal = pyqtSignal(int, int)  # 当前时间(ms)，总时间(ms)
     progress_update_signal = pyqtSignal(int, int)
+    # 在非 GUI 线程请求在主线程播放（避免线程直接操作 GUI）
+    play_request = pyqtSignal()
     
     def __init__(self):
         super().__init__()
@@ -54,7 +64,18 @@ class MusicPlayer(QWidget):
         self.is_playing = False
         self.music_long = 0  # 总时长(ms)
         self.quit_flag = 0
+        self.maxvol=50 #开发用的，可调节
         self.show_flag = 1  # 初始化为显示状态
+        self.playorder=0
+        self.dlnamode=False#更改是否使用dlna
+        self.myip=socket.gethostbyname(socket.gethostname())
+        self.port=random.randint(8000,10000)
+        print(f"当前IP地址为：{self.myip}，端口为：{self.port}")
+        # 记录 Sonos 上次的 transport state，避免切换设备时重复触发下一首
+        self._last_soco_transport = None
+        self.fix_std_streams()
+        self.draging=False
+        self.remain_playlist=[]
         self._smtc_player = winsdk.windows.media.playback.MediaPlayer()
         self._smtc = self._smtc_player.system_media_transport_controls
         self._smtc.add_button_pressed(self._on_smtc_button_pressed)
@@ -78,21 +99,30 @@ class MusicPlayer(QWidget):
         self.windowEffect = WindowEffect()
         self.setAttribute(Qt.WA_NoSystemBackground)
         self.window_position="left"
+        # http server started flag，避免重复启动
+        self._http_server_started = False
         # 更新UI主题
         self.update_ui_theme()
         
         # 关键修复：连接UI更新信号到处理函数
         self.update_ui_signal.connect(self.update_ui_handler)
+        # 连接播放请求信号，确保 play_music 在主线程执行
+        self.play_request.connect(self.play_music)
+        self.searching_dlna_devices=QTimer(self)
+        self.searching_dlna_devices.timeout.connect(lambda:self.search_dlna_devices(5))
+        self.searching_dlna_devices.start(30000)  # 每30s搜索一次dlna设备
         
         self.load_music_playlist()
         self.start_music_thread()
+        if self.dlnamode==True:
+            self.start_http_server()
         
         # 创建定时器线程，用于刷新UI
 
         self.refresh_timer=QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_ui)
         self.refresh_timer.start(500)  # 每500ms刷新一次
-
+        self.search_dlna_devices(0.5)
         
         self.hotkey_timer=QTimer(self)
         self.hotkey_timer.timeout.connect(self.hotkey)
@@ -113,7 +143,6 @@ class MusicPlayer(QWidget):
         """SMTC 按钮点击的回调函数"""
         # 获取点击的按钮类型（来自 media.MediaPlaybackControlButton 枚举）
         button_type = args.button
-        print(button_type)
         
         if button_type == winsdk.windows.media.SystemMediaTransportControlsButton.PLAY:
             self._smtc.playback_status =  winsdk.windows.media.MediaPlaybackStatus.PLAYING
@@ -128,6 +157,77 @@ class MusicPlayer(QWidget):
         
         elif button_type == winsdk.windows.media.SystemMediaTransportControlsButton.NEXT:
             self.next_song()
+    def search_dlna_devices(self,timeout):
+        # 发现设备，保证 devices 为稳定的列表（按 player_name 排序），避免不同次发现顺序变化导致索引漂移
+        try:
+            discovered = soco.discover(timeout=timeout)
+        except Exception:
+            discovered = None
+
+        devices = []
+        if discovered:
+            try:
+                devices = list(discovered)
+                devices.sort(key=lambda d: getattr(d, 'player_name', '').lower())
+            except Exception:
+                devices = list(discovered)
+
+        # 记录之前选中的设备（优先使用当前 soco_device 的 ip_address）
+        prev_soco_ip = None
+        try:
+            if getattr(self, 'dlnamode', False) and getattr(self, 'soco_device', None):
+                prev_soco_ip = getattr(self.soco_device, 'ip_address', None)
+        except Exception:
+            prev_soco_ip = None
+
+        # 备份当前 combo 文本以便回退匹配
+        try:
+            prev_text = self.play_device_choose.currentText()
+        except Exception:
+            prev_text = None
+
+        # 更新内部 devices 列表
+        self.devices = devices
+
+        # 重建下拉列表，期间屏蔽信号以避免触发 change_play_device
+        try:
+            self.play_device_choose.blockSignals(True)
+        except Exception:
+            pass
+        self.play_device_choose.clear()
+        self.play_device_choose.addItem("本机")
+        for device in self.devices:
+            try:
+                self.play_device_choose.addItem(device.player_name)
+            except Exception:
+                # 忽略无法读取名称的设备
+                self.play_device_choose.addItem("Unknown")
+
+        # 尝试恢复之前的选择：优先按 IP 匹配，其次按名称匹配，最后回退到 本机
+        restored_index = 0
+        if prev_soco_ip:
+            for i, d in enumerate(self.devices):
+                if getattr(d, 'ip_address', None) == prev_soco_ip:
+                    restored_index = i + 1
+                    break
+        if restored_index == 0 and prev_text and prev_text != "本机":
+            for i, d in enumerate(self.devices):
+                try:
+                    if d.player_name == prev_text:
+                        restored_index = i + 1
+                        break
+                except Exception:
+                    continue
+
+        try:
+            self.play_device_choose.setCurrentIndex(restored_index)
+        except Exception:
+            pass
+
+        try:
+            self.play_device_choose.blockSignals(False)
+        except Exception:
+            pass
     def quit_musicplayer(self):
         self.quit_flag = 1
         pygame.mixer.music.stop()
@@ -165,7 +265,12 @@ class MusicPlayer(QWidget):
         button_layout.addWidget(self.hide_show_button)
 
         self.move_button = QPushButton("滚动到当前播放", self.left_widget)
+        self.move_button.clicked.connect(self.to_now_playing)
         button_layout.addWidget(self.move_button)
+
+        self.change_order_button = QPushButton("顺序播放", self.left_widget)
+        self.change_order_button.clicked.connect(self.change_play_order)
+        button_layout.addWidget(self.change_order_button)
 
         self.search_button = QPushButton("搜索", self.left_widget)
         self.search_button.clicked.connect(self.search)
@@ -181,9 +286,16 @@ class MusicPlayer(QWidget):
         shadow1.setXOffset(2)
         shadow1.setYOffset(2)
         shadow1.setColor(QColor(0, 0, 0, 180))
+        self.play_device_choose=QComboBox(self.left_widget)
+        self.play_device_choose.setFixedWidth(60)
+        self.play_device_choose.view().adjustSize()
+        self.play_device_choose.currentIndexChanged.connect(self.change_play_device)
+        progress_layout.addWidget(self.play_device_choose)
+        self.play_device_choose.addItems(["本机"])
         self.now_time_label.setGraphicsEffect(shadow1)
         progress_layout.addWidget(self.now_time_label)
 
+        
         self.progress_bar = QProgressBar(self.left_widget)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.mousePressEvent = self.progress_bar_clicked
@@ -205,6 +317,19 @@ class MusicPlayer(QWidget):
         self.lyric_view = QListWidget(self)  # 父对象为主窗口
         # 清除歌词视图额外边距，避免顶部留下空白
         self.lyric_view.setContentsMargins(2,0,0,0)
+        # 记录歌词基准字号，用于高亮当前行时放大
+        base_pt = self.lyric_view.font().pointSize()
+        if not base_pt or base_pt <= 0:
+            base_pt = 12
+        self._lyric_base_font_size = base_pt
+        self._last_lyric_index = -1
+        # 用户滚动检测（如果用户在 3s 内滚动过，则暂停自动居中）
+        self._user_scrolled = False
+        self._last_user_scroll = 0.0
+        try:
+            self.lyric_view.verticalScrollBar().valueChanged.connect(self._on_lyric_scrolled)
+        except Exception:
+            pass
 
 
         self.splitter = QSplitter(Qt.Horizontal)  # 水平分割
@@ -220,9 +345,9 @@ class MusicPlayer(QWidget):
         self.image_label.setFixedSize(230, 230)  # 固定尺寸
         self.image_label.move(470,0) 
         self.baseboard=QLabel(self)
-        self.baseboard.setFixedSize(470,230)
+        self.baseboard.setFixedSize(700,230)
         self.baseboard.move(0,0) 
-        baseimage = Image.new("RGBA", (470, 230), (0, 0, 0, 1))
+        baseimage = Image.new("RGBA", (700, 230), (0, 0, 0, 1))
         try:
             buf = io.BytesIO()
             baseimage.save(buf, format='PNG')
@@ -243,30 +368,75 @@ class MusicPlayer(QWidget):
         _main_layout.addWidget(self.splitter)  # 分割器（左侧+歌词）加入主布局
 
         # 关键：无需调用self.setLayout(_main_layout)，因为_main_layout创建时已绑定self
+    def change_play_device(self,index):
+        print(index)
+        if index==0 or index==-1:
+            self.dlnamode=False
+        else:
+            self.dlnamode=True
+            self.soco_device=soco.SoCo(list(self.devices)[index-1].ip_address)
+            # 启动 http server 只需要一次
+            try:
+                if not getattr(self, '_http_server_started', False):
+                    self.start_http_server()
+                    self._http_server_started = True
+                    self.play_music()
+            except Exception:
+                pass
+
+            # 初始化上一次 transport 状态，避免切换设备时误判为 STOPPED
+            try:
+                self._last_soco_transport = self.soco_device.get_current_transport_info().get("current_transport_state")
+            except Exception:
+                self._last_soco_transport = None
     def update_smtc(self, song_name, artist, cover_bytes):
         self._smtc_updater.type = winsdk.windows.media.MediaPlaybackType.MUSIC
         self._smtc_updater.music_properties.title = song_name
         self._smtc_updater.music_properties.artist = artist
-        
 
         # 封面处理
+        # 当有封面字节且非空时设置缩略图，否则清空缩略图
         if cover_bytes:
             try:
-                # 从原始字节创建PIL图片
-                img = Image.open(io.BytesIO(cover_bytes))  # 关键：用BytesIO包装字节
+                # 从原始字节创建PIL图片并转换为 JPEG 字节流
+                img = Image.open(io.BytesIO(cover_bytes))
                 byte_stream = io.BytesIO()
-                img.save(byte_stream, format="JPEG")  # 转换为JPEG字节流
+                img.save(byte_stream, format="JPEG")
                 image_bytes = byte_stream.getvalue()
-                
-                # 转换为SMTC可识别的流对象
+
+                # 转换为 SMTC 可识别的流对象
                 stream = winsdk.windows.storage.streams.InMemoryRandomAccessStream()
                 writer = winsdk.windows.storage.streams.DataWriter(stream)
                 writer.write_bytes(image_bytes)
-                writer.store_async().get_results()  # 同步写入
+                writer.store_async().get_results()
                 self._smtc_updater.thumbnail = winsdk.windows.storage.streams.RandomAccessStreamReference.create_from_stream(stream)
             except Exception as e:
                 print(f"封面处理失败：{e}")
+                # 如果设置失败，确保 thumbnail 被清空（如果支持）以避免残留旧图
+                try:
+                    self._smtc_updater.thumbnail = None
+                except Exception:
+                    pass
+        else:
+            # 清空缩略图（优先设置为 None；如果属性不接受 None，则忽略异常）
+            try:
+                self._smtc_updater.thumbnail = None
+            except Exception:
+                # 退回方案：写入空字节流（确保 write_bytes 使用有效参数）
+                try:
+                    stream = winsdk.windows.storage.streams.InMemoryRandomAccessStream()
+                    writer = winsdk.windows.storage.streams.DataWriter(stream)
+                    writer.write_bytes(b"")
+                    writer.store_async().get_results()
+                    self._smtc_updater.thumbnail = winsdk.windows.storage.streams.RandomAccessStreamReference.create_from_stream(stream)
+                except Exception:
+                    pass
         self._smtc_updater.update()
+    def fix_std_streams(self):
+        if getattr(sys, 'frozen', False) and sys.stdout is None:
+            # 创建内存缓冲区作为stdout/stderr
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
     def update_ui_theme(self):
         self.is_dark = self.is_darkmode()
         if self.is_dark:
@@ -337,17 +507,55 @@ class MusicPlayer(QWidget):
                 background-color: rgba(80, 80, 80, 80);
             }}
         """)
+        # 更详细的分割条样式，分别处理横向/纵向把手并在悬停时使用主题色
         self.splitter.setStyleSheet(f"""
             QSplitter::handle {{
-                background-color: rgba(0, 0, 0,0);
+                background-color: rgba(0, 0, 0, 0);
+                margin: 0px;
+            }}
+            QSplitter::handle:horizontal {{
+                width: 5px;
+            }}
+            QSplitter::handle:vertical {{
+                height: 5px;
             }}
             QSplitter::handle:hover {{
-                background-color: rgba(0,0,255,255);
-                width: 5px;
-                height:5px;
+                background-color: {self.theme_color};
             }}
         """)
         # 滚动条样式
+        self.play_device_choose.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {self.bg_color};
+                color: {self.text_color};
+                border-radius: 5px;
+                padding: 5px;
+                font-family: "Microsoft YaHei", "微软雅黑";
+                font-size: 12px;
+            }}
+            QComboBox:hover{{
+                background-color: rgba(120, 120, 120, 150);
+            }}
+            QComboBox::drop-down {{
+                background-color:rgba(0,0,0,0);
+            }}
+            QCombobox QAbstractItemView{{
+                background-color: {self.bg_color};
+                color: {self.text_color};
+                border-radius: 5px;
+                padding: 5px;
+                font-family: "Microsoft YaHei", "微软雅黑";
+                font-size: 12px;
+            }}QComboBox QAbstractItemView::item {{
+                padding: 8px 16px;                 
+                margin: 2px 4px;                  
+                border-radius: 4px;               
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: rgba(255,255,255,0.1);  
+            }}
+
+        """)
         scroll_style = f"""
             QScrollBar:vertical {{
                 background: {self.scroll_bg};
@@ -417,6 +625,7 @@ class MusicPlayer(QWidget):
         self.hide_show_button.setStyleSheet(button_style)
         self.move_button.setStyleSheet(button_style)
         self.search_button.setStyleSheet(button_style)
+        self.change_order_button.setStyleSheet(button_style)
 
         # 标签样式
         label_style = f"""
@@ -447,7 +656,21 @@ class MusicPlayer(QWidget):
 
         # 应用全局样式
         self.setStyleSheet(base_style)
+    def t_server(self):
+            # 1. 用 partial 给处理器绑定 directory 参数
+            Handler = partial(SimpleHTTPRequestHandler, directory=self._playpath)
 
+            # 2. 创建服务器时，传递绑定后的处理器（不再传递 directory 给 HTTPServer）
+            self.server = HTTPServer(("0.0.0.0", self.port), Handler)
+            try:
+                self.server.serve_forever()
+            except OSError:
+                pass
+    def start_http_server(self):
+        
+        t = threading.Thread(target=self.t_server)
+        t.start()
+    
     def is_darkmode(self):
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
@@ -519,7 +742,7 @@ class MusicPlayer(QWidget):
     def load_music_playlist(self):#修改json
         # 使用 JSON 配置文件（config.json）存储 music_path
         config_file = Path('config.json')
-
+        self._playpath=""
         # 如果配置文件不存在，弹窗让用户选择音乐目录并创建配置文件
         if not config_file.exists():
             music_path = QFileDialog.getExistingDirectory(self, "请选择音乐文件夹（第一次启动配置）")
@@ -527,18 +750,21 @@ class MusicPlayer(QWidget):
                 # 用户取消选择，弹出警告并返回
                 QMessageBox.warning(self, "警告", "未选择音乐文件夹，程序将无法加载播放列表")
                 return
-            cfg = {"music_path": music_path}
+            self.cfg = {"music_path": music_path}
+            self._playpath = music_path
             try:
                 with config_file.open('w', encoding='utf-8') as f:
-                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+                    json.dump(self.cfg, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 print(f"[warn] 写入配置文件失败: {e}")
 
         # 读取配置
         try:
             with config_file.open('r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                playpath = cfg.get('music_path', '').strip()
+                self.cfg = json.load(f)
+                playpath = self.cfg.get('music_path', '').strip()
+                self._playpath = playpath
+                
         except Exception:
             playpath = ''
 
@@ -548,6 +774,7 @@ class MusicPlayer(QWidget):
         except FileNotFoundError:
             QMessageBox.warning(self, "警告", "路径不存在")
             music_path = QFileDialog.getExistingDirectory(self, "请选择音乐文件夹")
+            self._playpath = music_path
             if not music_path:
                 return
             try:
@@ -651,6 +878,15 @@ class MusicPlayer(QWidget):
         self.next_song()
     def _on_previous_pressed(self, sender, args):
         self.prev_song()
+    def change_play_order(self):
+        self.playorder=(self.playorder+1)%3
+        if self.playorder==0:
+            self.change_order_button.setText("顺序播放")
+        elif self.playorder==1:
+            self.change_order_button.setText("单曲循环")
+        elif self.playorder==2:
+            self.remain_playlist=self.playlist.copy()
+            self.change_order_button.setText("随机播放")
     def get_lyrics_on_file(self,path):
         """
         从本地 .lrc 文件读取歌词，支持多编码回退以避免 UnicodeDecodeError。
@@ -676,7 +912,6 @@ class MusicPlayer(QWidget):
                     for enc in ('utf-8-sig', 'utf-8', 'gbk', 'gb2312', 'cp1252', 'latin-1', 'utf-16'):
                         try:
                             lyrics_f = raw.decode(enc)
-                            print(lyrics_f)
                             return lyrics_f
                         except Exception:
                             continue
@@ -684,7 +919,6 @@ class MusicPlayer(QWidget):
                     # 最后保底：使用 replace 模式避免抛出
                     try:
                         lyrics_f = raw.decode('utf-8', errors='replace')
-                        print(lyrics_f)
                         return lyrics_f
                     except Exception as e:
                         print(f"[warn] 最终解码失败: {lyric_path} -> {e}")
@@ -796,6 +1030,7 @@ class MusicPlayer(QWidget):
     def play_songs(self):
         global lyrics_lines,lyrics
         if 0 <= self.current_index < len(self.playlist):
+            ishaveimg=False
             self.artist=""
             self.title=""
             music_folder = self.get_playpath()
@@ -817,6 +1052,7 @@ class MusicPlayer(QWidget):
                             album_image_original = tag.data
                             # 处理为 PIL.Image
                             pil_img = self.process_album_art_fast(album_image_original)
+                            ishaveimg=True
                             try:
                                 # 将 PIL.Image 保存为 PNG 字节，然后由 QPixmap 从数据加载
                                 buf = io.BytesIO()
@@ -834,8 +1070,12 @@ class MusicPlayer(QWidget):
                                 print(f"[warn] album art conversion failed: {e}")
                                 self.image_label.clear()
                             break
+                    if not ishaveimg:
+                        self.image_label.clear()
+                        album_image_original=None
             except:
                 self.image_label.clear()
+                album_image_original=None
             for line in lyric_list:
                 self.lyric_view.addItem(line)
 
@@ -857,8 +1097,19 @@ class MusicPlayer(QWidget):
                         self.title=self.playlist[self.current_index].split("-")[1].split(".")[0]
             except:
                 self.title=self.playlist[self.current_index].split(".")[0]
-            pygame.mixer.music.load(current_song)
-            pygame.mixer.music.play()
+            if self.dlnamode:
+                uncodedurl=f"http://{self.myip}:{self.port}/"+(self.playlist[self.current_index])
+                url=parse.quote(uncodedurl,safe=":/")
+                print(url)
+                self.soco_device.play_uri(url)
+                # 初始化/刷新 transport state，避免刚调用 play_uri 时被误判为 STOPPED
+                try:
+                    self._last_soco_transport = self.soco_device.get_current_transport_info().get("current_transport_state")
+                except Exception:
+                    self._last_soco_transport = None
+            else:
+                pygame.mixer.music.load(current_song)
+                pygame.mixer.music.play()
             self.is_playing = True
             self.play_button.setText("暂停")  
             self.list_widget.setCurrentRow(self.current_index)
@@ -903,8 +1154,8 @@ class MusicPlayer(QWidget):
         config_file = Path('config.json')
         try:
             with config_file.open('r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                return cfg.get('music_path', '').strip()
+                self.cfg = json.load(f)
+                return self.cfg.get('music_path', '').strip()
         except Exception:
             return ''
     def parse_lrc(self,lrc_content: str):
@@ -985,12 +1236,18 @@ class MusicPlayer(QWidget):
             return
             
         if self.is_playing:
-            pygame.mixer.music.pause()
+            if self.dlnamode==True:
+                self.soco_device.pause()
+            else:
+                pygame.mixer.music.pause()
             self.is_playing = False
             self.play_button.setText("播放")  # 修复按钮文字显示
             self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PAUSED
         else:
-            pygame.mixer.music.unpause()
+            if self.dlnamode==True:
+                self.soco_device.play()
+            else:
+                pygame.mixer.music.unpause()
             self.is_playing = True
             self.play_button.setText("暂停")  # 修复按钮文字显示
             self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PLAYING
@@ -1124,15 +1381,67 @@ class MusicPlayer(QWidget):
             if self.quit_flag == 1:
                 break
                 
-            if self.is_playing:
+            if self.is_playing and self.dlnamode==False:
                 current_pos = pygame.mixer.music.get_pos()
                 self.progress_update_signal.emit(current_pos, self.music_long)
-                if not pygame.mixer.music.get_busy() and self.playlist:
+                if not pygame.mixer.music.get_busy() and self.playlist and self.dlnamode==False:
                     c = 0
                     # 当一首歌曲播放完毕，自动播放下一首
-                    self.current_index = (self.current_index + 1) % len(self.playlist)
-                    self.play_music()
+                    if self.playorder==0:#顺序播放
+                        self.current_index = (self.current_index + 1) % len(self.playlist)
+                        self.change_order_button.setText("顺序播放")
+                    elif self.playorder==1:#单曲循环
+                        self.current_index = self.current_index % len(self.playlist)
+                        self.change_order_button.setText("单曲循环")
+                    elif self.playorder==2:#随机播放
+                        try:
+                            self.remain_playlist.remove(self.playlist[self.current_index])
+                        except:
+                            pass
+                        self.current_index=self.playlist.index(random.choice(self.remain_playlist))
+                        self.change_order_button.setText("随机播放")
+                    try:
+                        self.play_request.emit()
+                    except Exception:
+                        self.play_music()
+            if self.dlnamode==True:
+                self.now_time_label.setText("STREAMING")
+                try:
+                    self.total_time_label.setText(f"Vol: {self.soco_device.volume}")
+                except:
+                    self.dlnamode=False
 
+                self.progress_bar.setValue(self.soco_device.volume)
+            if self.is_playing and self.dlnamode==True:
+                try:
+                    state = self.soco_device.get_current_transport_info().get("current_transport_state")
+                except Exception:
+                    state = None
+
+                # 仅在 transport state 从非 STOPPED 变为 STOPPED 时触发下一首，防止在切换设备或查询期间重复触发
+                if state == "STOPPED" and self._last_soco_transport != "STOPPED":
+                    c = 0
+                    # 当一首歌曲播放完毕，自动播放下一首
+                    if self.playorder==0:#顺序播放
+                        self.current_index = (self.current_index + 1) % len(self.playlist)
+                        self.change_order_button.setText("顺序播放")
+                    elif self.playorder==1:#单曲循环
+                        self.current_index = self.current_index % len(self.playlist)
+                        self.change_order_button.setText("单曲循环")
+                    elif self.playorder==2:#随机播放
+                        try:
+                            self.remain_playlist.remove(self.playlist[self.current_index])
+                        except:
+                            pass
+                        self.current_index=self.playlist.index(random.choice(self.remain_playlist))
+                        self.change_order_button.setText("随机播放")
+                    try:
+                        self.play_request.emit()
+                    except Exception:
+                        self.play_music()
+
+                # 更新上一次状态
+                self._last_soco_transport = state
             time.sleep(0.1)
 
     def start_music_thread(self):
@@ -1144,7 +1453,12 @@ class MusicPlayer(QWidget):
         # 等待初始化完成
         time.sleep(1)
         if self.playlist:
-            self.play_music()
+            # 通过信号在主线程执行播放，避免后台线程直接操作 GUI
+            try:
+                self.play_request.emit()
+            except Exception:
+                # 退回到直接调用（极端情况下）
+                self.play_music()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1160,18 +1474,125 @@ class MusicPlayer(QWidget):
 
     def mouseMoveEvent(self, event):
         if hasattr(self, 'drag_position') and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPos() - self.drag_position)
+            # 计算目标左上角位置（基于初始 drag_position）
+            new_top_left = event.globalPos() - self.drag_position
+
+            # 使用屏幕矩形进行夹取(clamp)，避免窗口超出屏幕范围
+            screen_rect = self.primary_screen  # 已在 init_ui 中设置为 availableGeometry()
+
+            min_x = screen_rect.x()
+            max_x = screen_rect.x() + screen_rect.width() - self.width()
+            min_y = screen_rect.y()
+            max_y = screen_rect.y() + screen_rect.height() - self.height()
+
+            # 夹取 new_top_left 的坐标
+            clamped_x = max(min_x, min(new_top_left.x(), max_x))
+            clamped_y = max(min_y, min(new_top_left.y(), max_y))
+
+            # 靠近边缘时自动吸附（snap）——减少误差阈值
+            snap_threshold = 30
+            if abs(clamped_x - min_x) <= snap_threshold:
+                clamped_x = min_x
+            elif abs(max_x - clamped_x) <= snap_threshold:
+                clamped_x = max_x
+
+            # 根据窗口水平中心判断停靠方向（左/右）
+            center_x = clamped_x + (self.width() / 2)
+            screen_center_x = screen_rect.x() + (screen_rect.width() / 2)
+            self.window_position = "left" if center_x <= screen_center_x else "right"
+
+            # 最终移动窗口到夹取后的位置（即时移动以保持拖动流畅）
+            self.move(int(clamped_x), int(clamped_y))
             event.accept()
 
+    def mouseReleaseEvent(self, event):
+        # 在释放鼠标时，带动画将窗口贴靠到最近的左右屏幕边缘
+        if event.button() == Qt.LeftButton and hasattr(self, 'drag_position'):
+            try:
+                screen_rect = self.primary_screen
+                min_x = screen_rect.x()
+                max_x = screen_rect.x() + screen_rect.width() - self.width()
+
+                # 选择最近的边缘作为目标
+                cur_x = self.x()
+                target_x = min_x if abs(cur_x - min_x) <= abs(cur_x - max_x) else max_x
+                self.window_position = 'left' if target_x == min_x else 'right'
+
+                # 使用动画平滑贴靠
+                anim = QPropertyAnimation(self, b"pos")
+                anim.setDuration(150)
+                anim.setStartValue(self.pos())
+                anim.setEndValue(QPoint(int(target_x), int(self.y())))
+                anim.setEasingCurve(QEasingCurve.OutCubic)
+                anim.start()
+                # 保留引用避免被回收
+                self._snap_anim = anim
+            except Exception:
+                pass
+
+            # 清理拖动状态
+            try:
+                del self.drag_position
+            except Exception:
+                pass
+
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+    def nativeEvent(self, eventType, message):
+        # 只在Windows上处理
+        if eventType == "windows_generic_MSG":
+            msg = ctypes.wintypes.MSG.from_address(message.__int__())
+            if msg.message == 0x001A:  # WM_SETTINGCHANGE
+                # 检查是否是主题变化
+                if msg.lParam and ctypes.cast(msg.lParam, ctypes.c_wchar_p).value == "ImmersiveColorSet":
+                    # 主题变化，更新界面
+                    self.update_ui_theme()
+                    return True, 0
+        return super().nativeEvent(eventType, message)
     def refresh_ui(self):
             global lyric_index
             try:
-                if self.is_playing and pygame.mixer.music.get_busy() and self.playlist:
+                self.draging=False
+                if self.is_playing and pygame.mixer.music.get_busy() and self.playlist and not self.dlnamode:
                     a = pygame.mixer.music.get_pos()
                     current_pos = a + c
-                    lyric_index=bisect.bisect_left(lyrics,current_pos)-1
+                    lyric_index = bisect.bisect_left(lyrics, current_pos) - 1
+                    # 夹取索引范围，避免越界
+                    if lyric_index < 0:
+                        lyric_index = 0
+                    elif lyric_index >= self.lyric_view.count():
+                        lyric_index = self.lyric_view.count() - 1
+
+                    # 更新选择并居中当前行
                     self.lyric_view.setCurrentRow(lyric_index)
-                    self.lyric_view.scrollToItem(self.lyric_view.item(lyric_index))
+                    item = self.lyric_view.item(lyric_index)
+                    if item:
+                        # 恢复上一个高亮行的字体
+                        prev_idx = getattr(self, '_last_lyric_index', -1)
+                        if prev_idx is not None and prev_idx != -1 and prev_idx != lyric_index:
+                            try:
+                                prev_item = self.lyric_view.item(prev_idx)
+                                if prev_item:
+                                    f_prev = prev_item.font()
+                                    f_prev.setBold(False)
+                                    f_prev.setPointSize(self._lyric_base_font_size)
+                                    prev_item.setFont(f_prev)
+                            except Exception:
+                                pass
+
+                        # 设置当前行为加粗并放大
+                        try:
+                            f = item.font()
+                            f.setBold(True)
+                            f.setPointSize(self._lyric_base_font_size + 3)
+                            item.setFont(f)
+                        except Exception:
+                            pass
+
+                        # 使用 PositionAtCenter 将当前行居中
+                        self.lyric_view.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                        self._last_lyric_index = lyric_index
 
                     # 确保current_pos不超过总时长
                     if self.music_long > 0 and current_pos > self.music_long:
@@ -1191,28 +1612,14 @@ class MusicPlayer(QWidget):
                             self.update_ui_signal.emit(current_pos, self.music_long)
                         except Exception as e:
                             print(f"[warn] 获取音乐时长失败: {str(e)}")
-                elif self.is_playing and not pygame.mixer.music.get_busy():
+                elif self.is_playing and not pygame.mixer.music.get_busy() and not self.dlnamode:
                     # 播放结束但未切换歌曲时，强制更新进度条到100%
                     if self.music_long > 0:
                         self.update_ui_signal.emit(self.music_long, self.music_long)
-                #判断窗口是否超出屏幕
-                if self.pos().x()<=((self.primary_screen.width()-self.primary_screen.x())-self.width())/2:
-                    self.window_position="left"
-                    if self.pos().y()<self.primary_screen.y():
-                        self.move(self.primary_screen.x(),self.primary_screen.y())
-                    if self.pos().y()+self.height()>self.primary_screen.y()+self.primary_screen.height():
-                        self.move(self.primary_screen.x(),self.primary_screen.y()+self.primary_screen.height()-self.height())
-                    else:
-                        self.move(self.primary_screen.x(),self.pos().y())
-                if self.pos().x()>(self.primary_screen.width()-self.primary_screen.x()-self.width())/2:
-                    self.window_position="right"
-                    if self.pos().y()<self.primary_screen.y():
-                        self.move(self.primary_screen.width()-self.width()+self.primary_screen.x(),self.primary_screen.y())
-                    if self.pos().y()+self.height()>self.primary_screen.y()+self.primary_screen.height():
-                        self.move(self.primary_screen.width()-self.width()+self.primary_screen.x(),self.primary_screen.y()+self.primary_screen.height()-self.height())
-                    else:
-                        self.move(self.primary_screen.width()-self.width()+self.primary_screen.x(),self.pos().y())
-                
+                elif self.is_playing and self.dlnamode:
+                    volume = self.soco_device.volume
+                    self.update_ui_signal.emit(volume, 10)
+
             except:
                 pass
     lyric_index=0
@@ -1220,51 +1627,75 @@ class MusicPlayer(QWidget):
         global lyric_index
         """主线程中处理UI更新（关键修复：确保此函数被正确调用）"""
         # 更新当前时间标签
-        minutes = current_pos // 60000
-        seconds = (current_pos % 60000) // 1000
+        if not self.dlnamode:
+            minutes = current_pos // 60000
+            seconds = (current_pos % 60000) // 1000
 
-        self.now_time_label.setText(f"{minutes:02d}:{seconds:02d}")
-        
+            self.now_time_label.setText(f"{minutes:02d}:{seconds:02d}")
+            
 
 
-        # 更新进度条
-        if total_pos > 0:
-            self.progress_bar.setMaximum(total_pos)
-            self.progress_bar.setValue(current_pos)
-            self.progress_bar.update() 
-        # 更新总时间标签
-        if total_pos > 0:
-            total_minutes = total_pos // 60000
-            total_seconds = (total_pos % 60000) // 1000
-            self.total_time_label.setText(f"{total_minutes:02d}:{total_seconds:02d}")
+            # 更新进度条
+            if total_pos > 0:
+                self.progress_bar.setMaximum(total_pos)
+                self.progress_bar.setValue(current_pos)
+                self.progress_bar.update() 
+            # 更新总时间标签
+            if total_pos > 0:
+                total_minutes = total_pos // 60000
+                total_seconds = (total_pos % 60000) // 1000
+                self.total_time_label.setText(f"{total_minutes:02d}:{total_seconds:02d}")
 
     def closeEvent(self, event):
         """窗口关闭时清理资源"""
         self.quit_flag = 1
         pygame.mixer.quit()
+        window_x=self.pos().x()
+        window_y=self.pos().y()
+        self.server.server_close()
+        #self.cfg["x"]=window_x
+        #self.cfg["y"]=window_y
+        """
+        with open("config.json","w") as f:
+            json.dump(self.cfg,f)"""
         event.accept()
 
     def progress_bar_clicked(self, event):
         # 计算点击位置对应的音乐时间
         global c
-        if self.music_long <= 0:
-            return
+        if not self.dlnamode:
+            if self.music_long <= 0:
+                return
+                
+            width = self.progress_bar.width()
+            x = event.x()
+            ratio = x / width
+            target_time = int(self.music_long * ratio)
+            c = target_time - pygame.mixer.music.get_pos()
             
-        width = self.progress_bar.width()
-        x = event.x()
-        ratio = x / width
-        target_time = int(self.music_long * ratio)
-        c = target_time - pygame.mixer.music.get_pos()
-        
-        try:
-            # 设置音乐播放位置（毫秒转换为秒）
-            pygame.mixer.music.set_pos(target_time / 1000.0)
-            
-            # 立即更新UI
-            self.update_ui_signal.emit(target_time + c, self.music_long)
-        except Exception as e:
-            print(f"设置播放位置失败: {str(e)}")
-
+            try:
+                # 设置音乐播放位置（毫秒转换为秒）
+                pygame.mixer.music.set_pos(target_time / 1000.0)
+                
+                # 立即更新UI
+                self.update_ui_signal.emit(target_time + c, self.music_long)
+            except Exception as e:
+                print(f"设置播放位置失败: {str(e)}")
+        else:
+            width = self.progress_bar.width()
+            x = event.x()
+            ratio = x / width
+            volume = ratio * 100
+            if volume>=self.maxvol:
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Information)
+                msg.setText(f"音量设置为{self.maxvol}以上可能会导致音量过高，是否继续？")
+                msg.setWindowTitle("音量警告")
+                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                ret = msg.exec_()
+                if ret == QMessageBox.No:
+                    return
+            self.soco_device.volume=volume
 
 class SearchWindow(QWidget):
     def __init__(self, parent=None):
@@ -1383,6 +1814,7 @@ class SearchWindow(QWidget):
         if self.parent_player:
             self.parent_player.clear_highlight()
             self.parent_player.search_window = None  # 关键：关闭时清理引用
+        
         event.accept()
 
 
