@@ -23,12 +23,13 @@ import threading
 from PyQt5.QtWidgets import (QApplication, QLineEdit, QWidget, QCheckBox, 
                             QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, 
                             QLabel, QFileDialog, QMessageBox, QProgressBar, 
-                            QGraphicsDropShadowEffect, QSplitter, QAbstractItemView,QComboBox)
+                            QGraphicsDropShadowEffect, QSplitter, QAbstractItemView,QComboBox,QAbstractItemView)
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
-from PyQt5.QtGui import QColor,QPixmap, QIcon
+from PyQt5.QtGui import QColor,QPixmap, QIcon,QFont
 import keyboard
 from AcrylicEffect import WindowEffect  
 from mutagen.id3 import ID3, USLT ,APIC,TIT2
+from mutagen.flac import FLAC,Picture
 import winsdk.windows.media.playback as media_playback
 import winsdk.windows.media
 import winsdk.windows.storage.streams
@@ -38,7 +39,10 @@ import winsdk.windows.foundation
 
 
 
-c=0
+c=0#差值，pygame_music的get_pos有问题！
+is_scrolling=False
+no_scroll_event=0
+
 
 class MusicPlayer(QWidget):
     # 自定义信号，用于更新UI
@@ -57,6 +61,7 @@ class MusicPlayer(QWidget):
         
         # 设置窗口位置和大小
         self.setGeometry(0, 0, 700, 230)
+        self.dlnamode=False
         
         self.init_ui()
         self.playlist = []
@@ -67,7 +72,6 @@ class MusicPlayer(QWidget):
         self.maxvol=50 #开发用的，可调节
         self.show_flag = 1  # 初始化为显示状态
         self.playorder=0
-        self.dlnamode=False#更改是否使用dlna
         self.myip=socket.gethostbyname(socket.gethostname())
         self.port=random.randint(8000,10000)
         print(f"当前IP地址为：{self.myip}，端口为：{self.port}")
@@ -139,6 +143,40 @@ class MusicPlayer(QWidget):
         
         # 新增搜索窗口相关
         self.search_window = None
+    class advanced_list_view(QListWidget):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+            self.verticalScrollBar().setSingleStep(10)
+            
+        def wheelEvent(self, event):
+            global is_scrolling
+            global no_scroll_event
+            # 通过父窗口访问 MusicPlayer 实例
+            is_scrolling = True
+            no_scroll_event = 0  # 重置计数器
+                
+            # 调用父类方法实现正常滚动
+            super().wheelEvent(event)
+            is_scrolling = False
+        def setCurrentRow(self, row):
+            # 保存当前滚动位置
+            scroll_pos = self.verticalScrollBar().value()
+            
+            # 调用父类方法设置当前行
+            super().setCurrentRow(row)
+            
+            # 恢复滚动位置
+            self.verticalScrollBar().setValue(scroll_pos)
+            
+        def setCurrentItem(self, item):
+            # 保存当前滚动位置
+            scroll_pos = self.verticalScrollBar().value()
+            
+            # 调用父类方法设置当前项
+            super().setCurrentItem(item)
+            # 恢复滚动位置
+            self.verticalScrollBar().setValue(scroll_pos)
     def _on_smtc_button_pressed(self,sender, args):
         """SMTC 按钮点击的回调函数"""
         # 获取点击的按钮类型（来自 media.MediaPlaybackControlButton 枚举）
@@ -237,6 +275,7 @@ class MusicPlayer(QWidget):
         self.primary_screen = QApplication.primaryScreen().availableGeometry()
         self.setWindowTitle("音乐播放器")
         self.resize(700, 230)
+        self.scroll_status=0
         # 主布局（水平布局，管理整个窗口）
         _main_layout = QHBoxLayout(self)  # 绑定到主窗口，无需再调用setLayout
         # 去掉顶层布局默认的内边距和间距，避免列表顶部出现不必要的空隙
@@ -253,6 +292,8 @@ class MusicPlayer(QWidget):
         self.list_widget = QListWidget(self.left_widget)  # 父对象设为left_widget，确保被其布局管理
         self.list_widget.itemClicked.connect(self.play_selected_song)
         left_layout.addWidget(self.list_widget)  # 加入左侧布局
+        self.list_widget.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.list_widget.verticalScrollBar().setSingleStep(10)
 
         # 1.2 按钮区域（水平布局）
         button_layout = QHBoxLayout()
@@ -296,6 +337,7 @@ class MusicPlayer(QWidget):
         progress_layout.addWidget(self.now_time_label)
 
         
+        
         self.progress_bar = QProgressBar(self.left_widget)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.mousePressEvent = self.progress_bar_clicked
@@ -314,23 +356,17 @@ class MusicPlayer(QWidget):
 
 
         # ---------------------- 右侧歌词视图 ----------------------
-        self.lyric_view = QListWidget(self)  # 父对象为主窗口
+        self.lyric_view = self.advanced_list_view(self)  # 父对象为主窗口
         # 清除歌词视图额外边距，避免顶部留下空白
         self.lyric_view.setContentsMargins(2,0,0,0)
+        self.lyric_view.pressed.connect(self.lyric_view_pressed)
         # 记录歌词基准字号，用于高亮当前行时放大
         base_pt = self.lyric_view.font().pointSize()
         if not base_pt or base_pt <= 0:
             base_pt = 12
         self._lyric_base_font_size = base_pt
         self._last_lyric_index = -1
-        # 用户滚动检测（如果用户在 3s 内滚动过，则暂停自动居中）
-        self._user_scrolled = False
-        self._last_user_scroll = 0.0
-        try:
-            self.lyric_view.verticalScrollBar().valueChanged.connect(self._on_lyric_scrolled)
-        except Exception:
-            pass
-
+        
 
         self.splitter = QSplitter(Qt.Horizontal)  # 水平分割
         self.splitter.setHandleWidth(5)
@@ -370,17 +406,21 @@ class MusicPlayer(QWidget):
         # 关键：无需调用self.setLayout(_main_layout)，因为_main_layout创建时已绑定self
     def change_play_device(self,index):
         print(index)
-        if index==0 or index==-1:
+        if index==-1:
+            pass
+        elif index==0:
+            if self.dlnamode:
+                self.soco_device.stop()
             self.dlnamode=False
         else:
             self.dlnamode=True
             self.soco_device=soco.SoCo(list(self.devices)[index-1].ip_address)
             # 启动 http server 只需要一次
+            self.play_music()
             try:
                 if not getattr(self, '_http_server_started', False):
                     self.start_http_server()
                     self._http_server_started = True
-                    self.play_music()
             except Exception:
                 pass
 
@@ -533,29 +573,35 @@ class MusicPlayer(QWidget):
                 font-family: "Microsoft YaHei", "微软雅黑";
                 font-size: 12px;
             }}
-            QComboBox:hover{{
+            QComboBox:hover {{
                 background-color: rgba(120, 120, 120, 150);
             }}
             QComboBox::drop-down {{
-                background-color:rgba(0,0,0,0);
+                background-color: rgba(0, 0, 0, 0);
+                border: none;
             }}
-            QCombobox QAbstractItemView{{
+            QComboBox QAbstractItemView {{
                 background-color: {self.bg_color};
                 color: {self.text_color};
                 border-radius: 5px;
                 padding: 5px;
                 font-family: "Microsoft YaHei", "微软雅黑";
                 font-size: 12px;
-            }}QComboBox QAbstractItemView::item {{
-                padding: 8px 16px;                 
-                margin: 2px 4px;                  
-                border-radius: 4px;               
+                border: none;
             }}
             QComboBox QAbstractItemView::item:hover {{
-                background-color: rgba(255,255,255,0.1);  
+                background-color:rgba(255, 255, 255, 0.1);  
+                color: {self.text_color};  
+                border-radius: 5px;
             }}
-
+            QComboBox QAbstractItemView::item:selected {{
+                background-color:  {self.theme_color};
+                border: none;
+                border-radius: 5px;
+            }}
         """)
+
+
         scroll_style = f"""
             QScrollBar:vertical {{
                 background: {self.scroll_bg};
@@ -603,8 +649,13 @@ class MusicPlayer(QWidget):
                 background: none;
             }}
         """
+        add_style = f"""
+            QListWidget::item:selected {{
+                height:30px;
+            }}
+        """
         self.list_widget.setStyleSheet(self.list_widget.styleSheet() + scroll_style)
-        self.lyric_view.setStyleSheet(self.list_widget.styleSheet() + scroll_style)
+        self.lyric_view.setStyleSheet(self.list_widget.styleSheet() + scroll_style+add_style)
         
         # 按钮样式
         button_style = f"""
@@ -718,7 +769,7 @@ class MusicPlayer(QWidget):
         lyric_files = []
         for name in os.listdir(playpath):
             parts = name.split('.')
-            if len(parts) > 1 and (parts[-1].lower() == "mp3" or parts[-1].lower() == "wav"):
+            if len(parts) > 1 and (parts[-1].lower() == "mp3" or parts[-1].lower() == "flac"):
                 file_path = os.path.join(playpath, name)
                 creation_time = os.path.getctime(file_path)
                 music_files.append((name, creation_time))
@@ -790,6 +841,16 @@ class MusicPlayer(QWidget):
             self.current_index = 0
             self.play_music()
 
+    def lyric_view_pressed(self, index):
+        # 将 QModelIndex 转换为 QListWidgetItem
+        global c
+        c1=c
+        try:
+            if self.dlnamode==False:
+                c=(lyrics[index.row()]-pygame.mixer.music.get_pos())
+                pygame.mixer.music.set_pos(lyrics[index.row()]/1000)
+        except:
+            c=c1
     def search(self):
         print("[info] 歌曲搜索")
         # 检查窗口是否已存在且未关闭
@@ -893,7 +954,7 @@ class MusicPlayer(QWidget):
         根据传入的音乐文件路径匹配歌词文件名（不含扩展名）。
         返回字符串（读取失败返回 None）。
         """
-        path_no_ext = path.replace('.mp3', '')
+        path_no_ext = path.replace('.mp3', '').replace(".flac","")
 
         for entry in lyric_files:
             # lyric_files 中存储为 (name_without_ext, full_path)
@@ -932,25 +993,41 @@ class MusicPlayer(QWidget):
     def get_lyrics(self, path):
         try:
             # 加载 MP3 文件的 ID3 标签
-            audio = ID3(path)
-            
-            # 查找 USLT 帧（歌词帧）
-            # USLT 帧可能有多个（不同语言），这里取第一个
-            for frame in audio.values():
-                if isinstance(frame, USLT):
-                    # frame.text 即为歌词内容
-                    # frame.lang 是语言代码（如 'eng' 表示英文）
-                    # frame.description 是描述（通常为空）
-                    return frame.text
-            
-            # 若没有 USLT 帧，返回无歌词
-            return self.get_lyrics_on_file(path)
+            if path.endswith(".mp3"):
+                audio = ID3(path)
+                
+                # 查找 USLT 帧（歌词帧）
+                # USLT 帧可能有多个（不同语言），这里取第一个
+                for frame in audio.values():
+                    if isinstance(frame, USLT):
+                        # frame.text 即为歌词内容
+                        # frame.lang 是语言代码（如 'eng' 表示英文）
+                        # frame.description 是描述（通常为空）
+                        return frame.text
+                
+                # 若没有 USLT 帧，返回无歌词
+                return self.get_lyrics_on_file(path)
+            elif path.endswith(".flac"):
+                audio = FLAC(path)
+                
+                # 查找 USLT 帧（歌词帧）
+                # USLT 帧可能有多个（不同语言），这里取第一个
+                for frame in audio.values():
+                    if isinstance(frame, USLT):
+                        # frame.text 即为歌词内容
+                        # frame.lang 是语言代码（如 'eng' 表示英文）
+                        # frame.description 是描述（通常为空）
+                        return frame.text
+                
+                # 若没有 USLT 帧，返回无歌词
+                return self.get_lyrics_on_file(path)
         except:
             return self.get_lyrics_on_file(path)
     
-    def process_album_art_fast(self,image_data, output_size=(230, 230)):
+    def process_album_art_fast(self, image_data, output_size=(230, 230)):
         """
         快速版本：使用预计算和批量操作
+        调整顺序：先进行 alpha 通道处理，再进行模糊操作
         """
         # 打开和预处理图片
         if isinstance(image_data, str):
@@ -969,18 +1046,43 @@ class MusicPlayer(QWidget):
         width, height = img.size
 
         try:
-            # 生成两层不同强度的模糊图像
-            blurred_strong = img.filter(ImageFilter.GaussianBlur(30))
-            blurred_weak = img.filter(ImageFilter.GaussianBlur(1))
+            # 第一步：先添加 alpha 渐变
+            MIN_ALPHA = 0  # 左侧最小不透明值（0-255），可调整
+            GRADIENT_FRAC = 1.0
+            gradient_end = int(width * GRADIENT_FRAC)
+            
+            if gradient_end <= 0:
+                alpha_mask = Image.new('L', (width, height), 255)
+            else:
+                row = Image.new('L', (width, 1))
+                for x in range(width):
+                    if x <= gradient_end:
+                        frac = x / gradient_end
+                        alpha = int(frac * (255 - MIN_ALPHA) + MIN_ALPHA)
+                    else:
+                        alpha = 255
+                    row.putpixel((x, 0), alpha)
+                alpha_mask = row.resize((width, height), Image.Resampling.BILINEAR)
+
+            # 应用 alpha 通道到原图
+            img_with_alpha = img.copy()
+            img_with_alpha.putalpha(alpha_mask)
+
+            # 第二步：生成两层不同强度的模糊图像
+            STRONG_BLUR = 100
+            WEAK_BLUR = 0
+            
+            # 对带有 alpha 通道的图像进行模糊
+            blurred_strong = img_with_alpha.filter(ImageFilter.GaussianBlur(STRONG_BLUR))
+            blurred_weak = img_with_alpha.filter(ImageFilter.GaussianBlur(WEAK_BLUR))
 
             # 转为 numpy 数组并归一化到 [0,1]
             arr_strong = np.asarray(blurred_strong).astype(np.float32) / 255.0
             arr_weak = np.asarray(blurred_weak).astype(np.float32) / 255.0
 
-            # 根据 x 位置创建平滑的混合权重：左侧权重靠近 1（更模糊），右侧靠近 0（更清晰）
+            # 根据 x 位置创建平滑的混合权重
             xs = np.linspace(0.0, 1.0, width, dtype=np.float32)
-            # progress 为 0->1，从左到右；我们希望左侧更模糊，所以 weight_strong = 1 - progress
-            weight_strong = (1.0 - xs).reshape((1, width, 1))
+            weight_strong = np.power(1.0 - xs, 1.6).reshape((1, width, 1))
 
             # 将权重扩展到高度并混合两幅图像
             weight_strong = np.repeat(weight_strong, height, axis=0)
@@ -989,42 +1091,42 @@ class MusicPlayer(QWidget):
             # 转回 uint8 图像
             arr_out = np.clip(arr_blended * 255.0, 0, 255).astype(np.uint8)
             result = Image.fromarray(arr_out, mode='RGBA')
-
-            # 添加从左到右的 alpha 渐变：左侧完全透明（0%），在宽度的70%处达到完全不透明（100%），之后保持不透明
-            gradient_end = int(width * 0.7)
-            if gradient_end <= 0:
-                mask = Image.new('L', (width, height), 255)
-            else:
-                row = Image.new('L', (width, 1))
-                for x in range(width):
-                    if x <= gradient_end:
-                        alpha = int((x / gradient_end) * 255)
-                    else:
-                        alpha = 255
-                    row.putpixel((x, 0), alpha)
-                mask = row.resize((width, height), Image.Resampling.BILINEAR)
-
-            result.putalpha(mask)
-            return result
+            #再来一次alpha通道处理
+            # 应用 alpha 通道到结果图
+            result_with_alpha = result.copy()
+            result_with_alpha.putalpha(alpha_mask)
+            return result_with_alpha
+            
         except Exception as e:
             # 退回到简单的整体模糊并添加 alpha 渐变，保证不会抛出
             print(f"[warn] smooth blur failed, fallback: {e}")
             try:
-                fallback = img.filter(ImageFilter.GaussianBlur(6))
-                gradient_end = int(width * 0.7)
+                # 备用方案：先添加 alpha 渐变，再进行较弱的整体模糊
+                MIN_ALPHA = 120
+                GRADIENT_FRAC = 0.7
+                gradient_end = int(width * GRADIENT_FRAC)
+                
                 if gradient_end <= 0:
-                    mask = Image.new('L', (width, height), 255)
+                    alpha_mask = Image.new('L', (width, height), 255)
                 else:
                     row = Image.new('L', (width, 1))
                     for x in range(width):
                         if x <= gradient_end:
-                            alpha = int((x / gradient_end) * 255)
+                            frac = x / gradient_end
+                            alpha = int(frac * (255 - MIN_ALPHA) + MIN_ALPHA)
                         else:
                             alpha = 255
                         row.putpixel((x, 0), alpha)
-                    mask = row.resize((width, height), Image.Resampling.BILINEAR)
-                fallback.putalpha(mask)
+                    alpha_mask = row.resize((width, height), Image.Resampling.BILINEAR)
+
+                # 应用 alpha 通道并进行模糊
+                img_with_alpha = img.copy()
+                img_with_alpha.putalpha(alpha_mask)
+                
+                FALLBACK_BLUR = 50
+                fallback = img_with_alpha.filter(ImageFilter.GaussianBlur(FALLBACK_BLUR))
                 return fallback
+                
             except Exception:
                 return img
     def play_songs(self):
@@ -1044,11 +1146,36 @@ class MusicPlayer(QWidget):
             self.lyric_view.clear()
             lyrics,lyric_list=self.parse_lrc(lyrics)
             #这里放置图片
-            audio=ID3(current_song)
+            if current_song.endswith(".mp3"):
+                audio=ID3(current_song)
+            elif current_song.endswith(".flac"):
+                audio=FLAC(current_song)
             album_image_original=None
             try:
                     for tag in audio.values():
                         if isinstance(tag, APIC):
+                            album_image_original = tag.data
+                            # 处理为 PIL.Image
+                            pil_img = self.process_album_art_fast(album_image_original)
+                            ishaveimg=True
+                            try:
+                                # 将 PIL.Image 保存为 PNG 字节，然后由 QPixmap 从数据加载
+                                buf = io.BytesIO()
+                                pil_img.save(buf, format='PNG')
+                                data = buf.getvalue()
+                                pixmap = QPixmap()
+                                if pixmap.loadFromData(data):
+                                    # 保留对 pixmap 的引用，避免被垃圾回收导致显示问题
+                                    self._current_album_pixmap = pixmap
+                                    self.image_label.setPixmap(pixmap)
+                                else:
+                                    print("[warn] pixmap.loadFromData failed")
+                                    self.image_label.clear()
+                            except Exception as e:
+                                print(f"[warn] album art conversion failed: {e}")
+                                self.image_label.clear()
+                            break
+                        if isinstance(tag,Picture):
                             album_image_original = tag.data
                             # 处理为 PIL.Image
                             pil_img = self.process_album_art_fast(album_image_original)
@@ -1082,14 +1209,25 @@ class MusicPlayer(QWidget):
             
             if pygame.mixer.music.get_busy():
                 pygame.mixer.music.stop()
-            try:
-                self.title=audio["TIT2"][0]
-            except:
-                pass
-            try:
-                self.artist="&".join(audio["TPE1"])
-            except:
-                pass
+            if current_song.endswith(".mp3"):
+                try:
+                    self.title=audio["TIT2"][0]
+                except:
+                    pass
+                try:
+                    self.artist="&".join(audio["TPE1"])
+                except:
+                    pass
+
+            if current_song.endswith(".flac"):
+                try:
+                    self.title=audio["title"][0]
+                except:
+                    pass
+                try:
+                    self.artist="&".join(audio["artist"])
+                except:
+                    pass
             try:
                 if self.title=="":
                         self.title=self.playlist[self.current_index].split("-")[0]
@@ -1398,6 +1536,8 @@ class MusicPlayer(QWidget):
                             self.remain_playlist.remove(self.playlist[self.current_index])
                         except:
                             pass
+                        if self.remain_playlist==[]:
+                            self.remain_playlist=self.playlist.copy()
                         self.current_index=self.playlist.index(random.choice(self.remain_playlist))
                         self.change_order_button.setText("随机播放")
                     try:
@@ -1551,77 +1691,82 @@ class MusicPlayer(QWidget):
                     return True, 0
         return super().nativeEvent(eventType, message)
     def refresh_ui(self):
-            global lyric_index
-            try:
-                self.draging=False
-                if self.is_playing and pygame.mixer.music.get_busy() and self.playlist and not self.dlnamode:
-                    a = pygame.mixer.music.get_pos()
-                    current_pos = a + c
-                    lyric_index = bisect.bisect_left(lyrics, current_pos) - 1
-                    # 夹取索引范围，避免越界
-                    if lyric_index < 0:
-                        lyric_index = 0
-                    elif lyric_index >= self.lyric_view.count():
-                        lyric_index = self.lyric_view.count() - 1
+        global lyric_index, is_scrolling, no_scroll_event
+        try:
+            if self.is_playing and pygame.mixer.music.get_busy() and self.playlist and not self.dlnamode:
+                a = pygame.mixer.music.get_pos()
+                current_pos = a + c
+                lyric_index = bisect.bisect_left(lyrics, current_pos) - 1
+                
+                # 夹取索引范围，避免越界
+                if lyric_index < 0:
+                    lyric_index = 0
+                elif lyric_index >= self.lyric_view.count():
+                    lyric_index = self.lyric_view.count() - 1
 
-                    # 更新选择并居中当前行
-                    self.lyric_view.setCurrentRow(lyric_index)
-                    item = self.lyric_view.item(lyric_index)
-                    if item:
-                        # 恢复上一个高亮行的字体
-                        prev_idx = getattr(self, '_last_lyric_index', -1)
-                        if prev_idx is not None and prev_idx != -1 and prev_idx != lyric_index:
-                            try:
-                                prev_item = self.lyric_view.item(prev_idx)
-                                if prev_item:
-                                    f_prev = prev_item.font()
-                                    f_prev.setBold(False)
-                                    f_prev.setPointSize(self._lyric_base_font_size)
-                                    prev_item.setFont(f_prev)
-                            except Exception:
-                                pass
-
-                        # 设置当前行为加粗并放大
+                # 更新选择并居中当前行
+                self.lyric_view.setCurrentRow(lyric_index)
+                
+                item = self.lyric_view.item(lyric_index)
+                if item:
+                    # 恢复上一个高亮行的字体
+                    prev_idx = getattr(self, '_last_lyric_index', -1)
+                    if prev_idx is not None and prev_idx != -1 and prev_idx != lyric_index:
                         try:
-                            f = item.font()
-                            f.setBold(True)
-                            f.setPointSize(self._lyric_base_font_size + 3)
-                            item.setFont(f)
+                            prev_item = self.lyric_view.item(prev_idx)
+                            if prev_item:
+                                f_prev = QFont("微软雅黑")
+                                f_prev.setBold(False)
+                                f_prev.setPointSize(self._lyric_base_font_size)
+                                prev_item.setFont(f_prev)
                         except Exception:
                             pass
 
-                        # 使用 PositionAtCenter 将当前行居中
+                    # 设置当前行为加粗并放大
+                    try:
+                        font = QFont("等线", 16)
+                        f = font
+                        f.setBold(True)
+                        item.setFont(f)
+                    except Exception:
+                        pass
+
+                    # 只有在用户没有手动滚动时才自动滚动到当前歌词t)
+                    
+                    if no_scroll_event > 10:
                         self.lyric_view.scrollToItem(item, QAbstractItemView.PositionAtCenter)
-                        self._last_lyric_index = lyric_index
+                    else:
+                        no_scroll_event += 1                     
 
-                    # 确保current_pos不超过总时长
-                    if self.music_long > 0 and current_pos > self.music_long:
-                        current_pos = self.music_long
-                    
-                    # 发送信号到主线程更新UI（关键修复：确保信号持续发射）
-                    self.update_ui_signal.emit(current_pos, self.music_long)
-                    
-                    # 首次获取总时长
-                    if self.music_long == 0:
-                        try:
-                            music_folder = self.get_playpath()
-                            current_song = os.path.join(music_folder, self.playlist[self.current_index])
-                            audio = pygame.mixer.Sound(current_song)
-                            self.music_long = int(audio.get_length() * 1000)
-                            # 立即发送一次信号，确保总时长显示
-                            self.update_ui_signal.emit(current_pos, self.music_long)
-                        except Exception as e:
-                            print(f"[warn] 获取音乐时长失败: {str(e)}")
-                elif self.is_playing and not pygame.mixer.music.get_busy() and not self.dlnamode:
-                    # 播放结束但未切换歌曲时，强制更新进度条到100%
-                    if self.music_long > 0:
-                        self.update_ui_signal.emit(self.music_long, self.music_long)
-                elif self.is_playing and self.dlnamode:
-                    volume = self.soco_device.volume
-                    self.update_ui_signal.emit(volume, 10)
+                    self._last_lyric_index = lyric_index
 
-            except:
-                pass
+                # 确保current_pos不超过总时长
+                if self.music_long > 0 and current_pos > self.music_long:
+                    current_pos = self.music_long
+                
+                # 发送信号到主线程更新UI
+                self.update_ui_signal.emit(current_pos, self.music_long)
+                
+                # 首次获取总时长
+                if self.music_long == 0:
+                    try:
+                        music_folder = self.get_playpath()
+                        current_song = os.path.join(music_folder, self.playlist[self.current_index])
+                        audio = pygame.mixer.Sound(current_song)
+                        self.music_long = int(audio.get_length() * 1000)
+                        self.update_ui_signal.emit(current_pos, self.music_long)
+                    except Exception as e:
+                        print(f"[warn] 获取音乐时长失败: {str(e)}")
+            elif self.is_playing and not pygame.mixer.music.get_busy() and not self.dlnamode:
+                # 播放结束但未切换歌曲时，强制更新进度条到100%
+                if self.music_long > 0:
+                    self.update_ui_signal.emit(self.music_long, self.music_long)
+            elif self.is_playing and self.dlnamode:
+                volume = self.soco_device.volume
+                self.update_ui_signal.emit(volume, 10)
+
+        except Exception as e:
+            print(f"[warn] refresh_ui error: {e}")
     lyric_index=0
     def update_ui_handler(self, current_pos, total_pos):
         global lyric_index
@@ -1645,6 +1790,10 @@ class MusicPlayer(QWidget):
                 total_minutes = total_pos // 60000
                 total_seconds = (total_pos % 60000) // 1000
                 self.total_time_label.setText(f"{total_minutes:02d}:{total_seconds:02d}")
+        if self.dlnamode:
+            self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(self.soco_device.volume)
+            self.progress_bar.update()
 
     def closeEvent(self, event):
         """窗口关闭时清理资源"""
