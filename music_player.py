@@ -10,6 +10,7 @@ from PIL import Image, ImageFilter
 import numpy as np
 import io
 from io import BytesIO
+import platform
 import json
 import ctypes
 from urllib import parse
@@ -80,17 +81,19 @@ class MusicPlayer(QWidget):
         self.fix_std_streams()
         self.draging=False
         self.remain_playlist=[]
-        self._smtc_player = winsdk.windows.media.playback.MediaPlayer()
-        self._smtc = self._smtc_player.system_media_transport_controls
-        self._smtc.add_button_pressed(self._on_smtc_button_pressed)
-        self._smtc.is_play_enabled = True
-        self._smtc.is_pause_enabled = True
-        self._smtc.is_next_enabled = True
-        self._smtc.is_previous_enabled = True
-        self._smtc_updater = self._smtc.display_updater
-        self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PLAYING
-        # 主题相关属性
-        self.bg_color = ""
+        self.smtc_available=True
+        try:
+            self._smtc_player = winsdk.windows.media.playback.MediaPlayer()
+            self._smtc = self._smtc_player.system_media_transport_controls
+            self._smtc.add_button_pressed(self._on_smtc_button_pressed)
+            self._smtc.is_play_enabled = True
+            self._smtc.is_pause_enabled = True
+            self._smtc.is_next_enabled = True
+            self._smtc.is_previous_enabled = True
+            self._smtc_updater = self._smtc.display_updater
+            self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PLAYING
+        except:
+            self.smtc_available=False
         self.text_color = ""
         self.scroll_bg = ""
         self.scroll_handle = ""
@@ -99,10 +102,23 @@ class MusicPlayer(QWidget):
         self.theme_color2 = ""
         self.is_dark = False
         self.setWindowIcon(QIcon("vacuum_music_player.ico"))
-        # 设置窗口效果
-        self.windowEffect = WindowEffect()
-        self.setAttribute(Qt.WA_NoSystemBackground)
         self.window_position="left"
+        self.effect="Disabled"
+        # 主题相关属性
+        if platform.uname().system=="Windows":
+            if int(platform.uname().version.split(".")[0])>=10:
+                self.windowEffect = WindowEffect()
+                self.effect="Acrylic"
+                self.setAttribute(Qt.WA_NoSystemBackground)
+                
+            elif int(platform.uname().version.split(".")[0])>=6:
+                self.windowEffect=WindowEffect()
+                self.effect="Aero"
+                self.setAttribute(Qt.WA_NoSystemBackground)
+        
+        
+        # 设置窗口效果
+        
         # http server started flag，避免重复启动
         self._http_server_started = False
         # 更新UI主题
@@ -493,8 +509,13 @@ class MusicPlayer(QWidget):
             self.scroll_bg = "rgba(240, 240, 240, 100)"
             self.scroll_handle = "rgba(200, 200, 200, 150)"
             self.scroll_handle_hover = "rgba(180, 180, 180, 180)"
-            # 设置浅色模式下的亚克力效果
-            self.windowEffect.setAcrylicEffect(int(self.winId()), gradientColor="FFFFFFA0")
+            # 设置浅色模式下的亚克力效果  mica效果待定
+            if self.effect=="Acrylic":
+                self.windowEffect.setAcrylicEffect(int(self.winId()), gradientColor="FFFFFFA0")
+            elif self.effect=="Aero":
+                self.windowEffect.setAeroEffect(int(self.winId()))
+            else:
+                pass
         
         # 获取 Windows 主题色
         try:
@@ -1267,7 +1288,8 @@ class MusicPlayer(QWidget):
             
         '''try:'''
         self.play_songs()
-        self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PLAYING
+        if self.smtc_available:
+            self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PLAYING
         lyric_index = 0
         '''except Exception as e:
             for i in range(5):
@@ -1380,7 +1402,8 @@ class MusicPlayer(QWidget):
                 pygame.mixer.music.pause()
             self.is_playing = False
             self.play_button.setText("播放")  # 修复按钮文字显示
-            self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PAUSED
+            if self.smtc_available:
+                self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PAUSED
         else:
             if self.dlnamode==True:
                 self.soco_device.play()
@@ -1388,7 +1411,8 @@ class MusicPlayer(QWidget):
                 pygame.mixer.music.unpause()
             self.is_playing = True
             self.play_button.setText("暂停")  # 修复按钮文字显示
-            self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PLAYING
+            if self.smtc_available:
+                self._smtc.playback_status = winsdk.windows.media.MediaPlaybackStatus.PLAYING
 
     def prev_song(self):
         global c
@@ -1801,7 +1825,10 @@ class MusicPlayer(QWidget):
         pygame.mixer.quit()
         window_x=self.pos().x()
         window_y=self.pos().y()
-        self.server.server_close()
+        try:
+            self.server.server_close()
+        except:
+            pass
         #self.cfg["x"]=window_x
         #self.cfg["y"]=window_y
         """
@@ -1898,6 +1925,7 @@ class SearchWindow(QWidget):
             is_dark = self.parent_player.is_dark
             bg_color = self.parent_player.bg_color
             text_color = self.parent_player.text_color
+            effect = self.parent_player.effect
         else:
             # 默认主题
             is_dark = False
@@ -1908,7 +1936,12 @@ class SearchWindow(QWidget):
         if is_dark:
             self.windowEffect.setAcrylicEffect(int(self.winId()), gradientColor="404040A0")
         else:
-            self.windowEffect.setAcrylicEffect(int(self.winId()), gradientColor="FFFFFFA0")
+            if effect=="Acrylic":
+                self.windowEffect.setAcrylicEffect(int(self.winId()), gradientColor="FFFFFFA0")
+            elif effect=="Aero":
+                self.windowEffect.setAeroEffect(int(self.winId()))
+            else:
+                pass
         
         # 设置按钮样式
         button_style = f"""
