@@ -16,17 +16,20 @@ import ctypes
 from urllib import parse
 import random
 import soco
+import traceback
 import socket
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from functools import partial  # 用于绑定参数
 import threading
+import struct
+import re
 from PyQt5.QtWidgets import (QApplication, QLineEdit, QWidget, QCheckBox, 
                             QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, 
                             QLabel, QFileDialog, QMessageBox, QProgressBar, 
-                            QGraphicsDropShadowEffect, QSplitter, QAbstractItemView,QComboBox,QAbstractItemView)
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPoint, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup,QEvent
-from PyQt5.QtGui import QColor,QPixmap, QIcon,QFont
+                            QGraphicsDropShadowEffect, QSplitter, QAbstractItemView,QComboBox,QAbstractItemView, QStyledItemDelegate)
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPoint, QPropertyAnimation,QSize, QEasingCurve, QParallelAnimationGroup,QEvent
+from PyQt5.QtGui import QColor,QPixmap, QIcon,QFont, QPainter, QPen, QBrush
 import keyboard
 from AcrylicEffect import WindowEffect  
 from OnlineSongsGet import OnlineDownloader,TrackInfo
@@ -37,15 +40,470 @@ import winsdk.windows.media
 import winsdk.windows.storage.streams
 from ctypes import wintypes
 import winsdk.windows.foundation
-
+from typing import List, Dict, Any, Tuple, Optional
+import base64
+import asyncio
+import websockets
+import struct
+import qasync
 # 初始化 SMTC
 
+MAGIC = {
+    "Ping": 0,
+    "Pong": 1,
+    "SetMusicInfo": 2,
+    "SetMusicAlbumCoverImageURI": 3,
+    "SetMusicAlbumCoverImageData": 4,
+    "OnPlayProgress": 5,
+    "OnVolumeChanged": 6,
+    "OnPaused": 7,
+    "OnResumed": 8,
+    "OnAudioData": 9,
+    "SetLyric": 10,
+    "SetLyricFromTTML": 11,
+    "Pause": 12,
+    "Resume": 13,
+    "ForwardSong": 14,
+    "BackwardSong": 15,
+    "SetVolume": 16,
+    "SeekPlayProgress": 17,
+}
+REVERSE_MAGIC = {v: k for k, v in MAGIC.items()}
+
+
+class buildPacketforConnection():
+    def build_nullstring(self,s: str) -> bytes:
+        """构建以 \0 结尾的 UTF-8 字符串"""
+        return s.encode('utf-8') + b'\x00'
+
+    def build_vec(self,items: List[bytes]) -> bytes:
+        """构建 Vec<T>：前4字节小端u32长度，后跟各元素序列"""
+        length = len(items)
+        return struct.pack('<I', length) + b''.join(items)
+
+    def build_artist(self,artist: Dict[str, str]) -> bytes:
+        """构建 Artist 结构"""
+        print(artist)
+        return self.build_nullstring(artist['id']) + self.build_nullstring(artist['name'])
+
+    def build_lyric_word(self,word: Dict[str, Any]) -> bytes:
+        """构建 LyricWord 结构"""
+        return (struct.pack('<Q', word['start_time']) +
+                struct.pack('<Q', word['end_time']) +
+                self.build_nullstring(word['word']))
+
+    def build_lyric_line(self,line: Dict[str, Any]) -> bytes:
+        """构建 LyricLine 结构"""
+        words_bytes = self.build_vec([self.build_lyric_word(w) for w in line['words']])
+        return (struct.pack('<Q', line['start_time']) +
+                struct.pack('<Q', line['end_time']) +
+                words_bytes +
+                self.build_nullstring(line.get('translated_lyric', '')) +
+                self.build_nullstring(line.get('roman_lyric', '')) +
+                struct.pack('<B', line.get('flag', 0)))
+
+    def build_message(self,magic: int, payload: bytes = b'') -> bytes:
+        """构建完整消息：magic(2字节) + payload"""
+        return struct.pack('<H', magic) + payload
+
+    # ==================== 具体消息构建 ====================
+    def build_set_music_info(self,
+        music_id: str,
+        music_name: str,
+        album_id: str,
+        album_name: str,
+        artists: List[Dict[str, str]],
+        duration: int
+    ) -> bytes:
+        """构建 SetMusicInfo 消息"""
+        payload = (self.build_nullstring(music_id) +
+                self.build_nullstring(music_name) +
+                self.build_nullstring(album_id) +
+                self.build_nullstring(album_name) +
+                self.build_vec([self.build_artist(a) for a in artists]) +
+                struct.pack('<Q', duration))
+        return self.build_message(MAGIC["SetMusicInfo"], payload)
+
+    def build_set_music_album_cover_image_uri(self,img_url: str) -> bytes:
+        """构建 SetMusicAlbumCoverImageURI 消息"""
+        return self.build_message(MAGIC["SetMusicAlbumCoverImageURI"], self.build_nullstring(img_url))
+
+    def build_set_music_album_cover_image_data(self,data: bytes) -> bytes:
+        """构建 SetMusicAlbumCoverImageData 消息"""
+        payload = struct.pack('<I', len(data)) + data
+        return self.build_message(MAGIC["SetMusicAlbumCoverImageData"], payload)
+
+    def build_on_play_progress(self,progress_ms: int) -> bytes:
+        """构建 OnPlayProgress 消息"""
+        return self.build_message(MAGIC["OnPlayProgress"], struct.pack('<Q', progress_ms))
+
+    def build_on_volume_changed(self,volume: float) -> bytes:
+        """构建 OnVolumeChanged 消息 (f64)"""
+        return self.build_message(MAGIC["OnVolumeChanged"], struct.pack('<d', volume))
+
+    def build_on_paused(self) -> bytes:
+        """构建 OnPaused 消息"""
+        return self.build_message(MAGIC["OnPaused"])
+
+    def build_on_resumed(self) -> bytes:
+        """构建 OnResumed 消息"""
+        return self.build_message(MAGIC["OnResumed"])
+
+    def build_set_lyric(self,lyric_lines: List[Dict[str, Any]]) -> bytes:
+        """构建 SetLyric 消息"""
+        lines_bytes = [self.build_lyric_line(line) for line in lyric_lines]
+        payload = self.build_vec(lines_bytes)
+        return self.build_message(MAGIC["SetLyric"], payload)
+
+    def build_pong(self) -> bytes:
+        """构建 Pong 消息（用于响应 Ping）"""
+        return self.build_message(MAGIC["Pong"])
+
+class AMLLProtocolHelper(buildPacketforConnection):
+    """
+    继承自 buildPacketforConnection，专注于将 LRC 歌词转换为 SetLyric 二进制消息。
+    移除 TTML 相关功能，全部使用 SetLyric (magic=10) 消息。
+    """
+
+    # ---------- 静态工具方法 ----------
+    CHINESE_CHARS = re.compile(r'[\u4e00-\u9fff]')
+    ENGLISH_LETTERS = re.compile(r'[a-zA-Z]')
+
+    @staticmethod
+    def _is_chinese(char: str) -> bool:
+        return '\u4e00' <= char <= '\u9fff'
+
+    @staticmethod
+    def _count_languages(text: str) -> Tuple[int, int]:
+        chinese = sum(1 for c in text if AMLLProtocolHelper._is_chinese(c))
+        english = sum(1 for c in text if c.isalpha() and not AMLLProtocolHelper._is_chinese(c))
+        return chinese, english
+
+    @staticmethod
+    def parse_lrc(lrc_content: str) -> List[Tuple[int, str]]:
+        """
+        解析 LRC 文本，返回按时间排序的 (毫秒, 歌词行) 列表。
+        支持 [mm:ss] 和 [mm:ss.xx] 两种格式，自动过滤元数据行。
+        """
+        if not lrc_content:
+            return []
+        line_re = re.compile(r'\[(\d+):(\d+(?:\.\d+)?)\](.*)')
+        lines = []
+        for line in lrc_content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = line_re.match(line)
+            if match:
+                minutes = int(match.group(1))
+                seconds = float(match.group(2))
+                text = match.group(3).strip()
+                if text:
+                    timestamp = int(minutes * 60000 + seconds * 1000)
+                    lines.append((timestamp, text))
+        lines.sort(key=lambda x: x[0])
+        return lines
+
+    @staticmethod
+    def detect_main_language(lines: List[Tuple[int, str]]) -> str:
+        """根据歌词行统计返回主要语言：'zh' 或 'en'。"""
+        total_zh = 0
+        total_en = 0
+        for _, text in lines:
+            zh, en = AMLLProtocolHelper._count_languages(text)
+            total_zh += zh
+            total_en += en
+        return 'zh' if total_zh > total_en else 'en'
+
+    @staticmethod
+    def split_translation(line_text: str, main_lang: str) -> Tuple[str, str]:
+        """
+        根据主要语言分割一行歌词为 (原歌词, 翻译)。
+        若没有检测到翻译，翻译部分返回空字符串。
+        """
+        _line=line_text.split(" ")
+        translate=""
+        line=""
+        for word in _line:
+            if word.startswith("["):
+                continue
+            if main_lang=="en" and AMLLProtocolHelper._is_chinese(word) and _line.index(word)>=len(_line)*0.5:
+                translate+=(word+" ")
+            else:
+                line+=(word+" ")
+
+        return line, translate
+
+    @staticmethod
+    def _split_into_words(text: str) -> List[str]:
+        """按空格分割文本为单词列表（保留标点符号）"""
+        return text.split()
+
+    @staticmethod
+    def _generate_pseudo_words(text: str, start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
+        """
+        生成伪逐字歌词（单词级），按单词平均分配时间。
+        返回 LyricWord 结构的列表（尚未序列化）。
+        """
+        words = AMLLProtocolHelper._split_into_words(text)
+        if not words:
+            return []
+        duration = end_ms - start_ms
+        word_duration = duration // len(words)
+        remainder = duration % len(words)
+        result = []
+        current = start_ms
+        for i, w in enumerate(words):
+            w_end = current + word_duration + (1 if i == len(words) - 1 else 0) * remainder
+            result.append({
+                'start_time': current,
+                'end_time': w_end,
+                'word': w
+            })
+            current = w_end
+        return result
+
+    # ---------- 核心转换方法 ----------
+    def lrc_to_lyric_lines(
+        self,   
+        lines: List[Tuple[int, str]],
+        main_lang: Optional[str] = None,
+        use_pseudo_words: bool = True,
+        split_translation: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        将 LRC 行列表转换为适用于 build_set_lyric 的 LyricLine 字典列表。
+
+        参数：
+            lines: parse_lrc 返回的列表。
+            main_lang: 若为 None，则自动检测。
+            use_pseudo_words: 若为 True，生成伪逐字歌词（按单词分割）；
+                            若为 False，生成单个单词包含整行文本。
+            split_translation: 若为 True，尝试分割翻译并填入 translated_lyric 字段。
+        返回：
+            每个字典包含字段：
+                start_time (int), end_time (int), words (list),
+                translated_lyric (str), roman_lyric (str), flag (int)
+        """
+        if not lines:
+            return []
+        if main_lang is None:
+            main_lang = self.detect_main_language(lines)
+
+        lyric_lines = []
+        for i, (ts, text) in enumerate(lines):
+            if split_translation:
+                original, translation = self.split_translation(text, main_lang)
+            else:
+                original, translation = text, ""
+
+            # 计算结束时间（使用下一行开始时间，最后一行加5秒）
+            if i + 1 < len(lines):
+                end_ts = lines[i + 1][0]
+            else:
+                end_ts = ts + 5000
+
+            # 确定单词列表
+            if use_pseudo_words and original:
+                # 伪逐字：将原歌词按单词拆分
+                words = self._generate_pseudo_words(original, ts, end_ts)
+            else:
+                # 非伪逐字：将整行原歌词作为一个单词（如果原歌词为空，则尝试使用翻译）
+                text_for_word = original if original else translation
+                if text_for_word:
+                    words = [{
+                        'start_time': ts,
+                        'end_time': end_ts,
+                        'word': text_for_word
+                    }]
+                else:
+                    words = []  # 极端情况：原歌词和翻译都为空，则忽略该行
+
+            lyric_lines.append({
+                'start_time': ts,
+                'end_time': end_ts,
+                'words': words,
+                'translated_lyric': translation,
+                'roman_lyric': "",
+                'flag': 0
+            })
+        return lyric_lines
+
+    def convert_lrc_to_set_lyric(
+        self,
+        lrc_content: str,
+        use_pseudo_words: bool = True,
+        split_translation: bool = True
+    ) -> bytes:
+        """
+        将 LRC 内容转换为 SetLyric 二进制消息。
+        内部调用父类的 build_set_lyric 方法完成序列化。
+        """
+        lines = self.parse_lrc(lrc_content)
+        lyric_data = self.lrc_to_lyric_lines(
+            lines,
+            use_pseudo_words=use_pseudo_words,
+            split_translation=split_translation
+        )
+        # 调用父类的 build_set_lyric 方法
+        return self.build_set_lyric(lyric_data)
+
+class RippleButton(QPushButton):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ripple_radius = 0
+        self.ripple_center = QPoint()
+        self.ripple_timer = QTimer(self)
+        self.ripple_timer.timeout.connect(self.update_ripple)
+        self.max_radius = 0
+        self.ripple_opacity = 20
+        self.theme_color = QColor(100, 100, 100)  # Default
+
+        # Shadow effect
+        self.shadow = QGraphicsDropShadowEffect(self)
+        self.shadow.setBlurRadius(0)
+        self.shadow.setXOffset(0)
+        self.shadow.setYOffset(0)
+        self.shadow.setColor(QColor(0, 0, 0, 100))
+        self.setGraphicsEffect(self.shadow)
+
+        # Animation for shadow
+        self.shadow_animation = QPropertyAnimation(self.shadow, b"blurRadius")
+        self.shadow_animation.setDuration(10)  # 300ms
+        self.shadow_animation.setEasingCurve(QEasingCurve.OutQuad)
+
+    def set_theme_color(self, color):
+        if isinstance(color, str):
+            self.theme_color = QColor(color)
+        else:
+            self.theme_color = color
+
+    def enterEvent(self, event):
+        self.shadow_animation.setStartValue(self.shadow.blurRadius())
+        self.shadow_animation.setEndValue(5)  # Max blur
+        self.shadow_animation.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.shadow_animation.setStartValue(self.shadow.blurRadius())
+        self.shadow_animation.setEndValue(0)
+        self.shadow_animation.start()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.ripple_center = event.pos()
+            self.ripple_radius = 0
+            self.ripple_opacity = 100
+            self.max_radius = max(self.width(), self.height()) * 1.5
+            self.ripple_timer.start(16)  # ~60 FPS
+        super().mousePressEvent(event)
+
+    def update_ripple(self):
+        self.ripple_radius += self.width() / 20  # Adjust speed
+        self.ripple_opacity = max(0, self.ripple_opacity - 3)
+        self.update()
+        if self.ripple_radius > self.max_radius or self.ripple_opacity <= 0:
+            self.ripple_timer.stop()
+            self.ripple_radius = 0
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.ripple_radius > 0:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            color = QColor(self.theme_color.red(), self.theme_color.green(), self.theme_color.blue(), self.ripple_opacity)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(self.ripple_center, self.ripple_radius, self.ripple_radius)
+
+
+class RippleItemDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ripple_data = {}  # {index: (center, radius, opacity)}
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_ripples)
+        self.theme_color = QColor(100, 100, 100)  # Default
+
+    def set_theme_color(self, color):
+        if isinstance(color, str):
+            self.theme_color = QColor(color)
+        else:
+            self.theme_color = color
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            # Start ripple for this item
+            rect = option.rect
+            center = event.pos() - rect.topLeft()
+            max_radius = max(rect.width(), rect.height()) * 1.5
+            self.ripple_data[index.row()] = (center, 0, 255, max_radius)
+            self.timer.start(16)
+            # Trigger repaint
+            self.parent().viewport().update()
+        return super().editorEvent(event, model, option, index)
+
+    def update_ripples(self):
+        to_remove = []
+        for row, (center, radius, opacity, max_radius) in self.ripple_data.items():
+            radius = min(radius + 20, max_radius)  # Adjust speed
+            opacity = max(0, opacity - 3)
+            self.ripple_data[row] = (center, radius, opacity, max_radius)
+            if opacity <= 0:
+                to_remove.append(row)
+        for row in to_remove:
+            del self.ripple_data[row]
+        if not self.ripple_data:
+            self.timer.stop()
+        self.parent().viewport().update()
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.row() in self.ripple_data:
+            center, radius, opacity, _ = self.ripple_data[index.row()]
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setClipRect(option.rect)  # Clip to item rect
+            painter.translate(option.rect.topLeft())
+            color = QColor(self.theme_color.red(), self.theme_color.green(), self.theme_color.blue(), opacity)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(center, radius, radius)
+            painter.restore()
+
+
+class AnimatedProgressBar(QProgressBar):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.normal_height = 6  # Normal height
+        self.hover_height = 24  # Hover height
+        self.animation = QPropertyAnimation(self, b"size")
+        self.animation.setDuration(200)
+        self.animation.setEasingCurve(QEasingCurve.OutQuad)
+        self.animation.finished.connect(self.updateGeometry)
+
+    def enterEvent(self, event):
+        self.setFixedHeight(self.hover_height)
+        self.animation.setStartValue(self.size())
+        self.animation.setEndValue(QSize(self.width(), self.hover_height))
+        self.animation.setDuration(200)
+        self.animation.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setFixedHeight(self.normal_height)
+        self.animation.setStartValue(self.size())
+        self.animation.setEndValue(QSize(self.width(), self.normal_height))
+        self.animation.setDuration(200)
+        self.animation.start()
+        super().leaveEvent(event)
 
 
 c=0#差值，pygame_music的get_pos有问题！
 is_scrolling=False
 no_scroll_event=0
-downloading=False
+#downloading=False
 
 class RECT(ctypes.Structure):
     _fields_ = [
@@ -58,6 +516,7 @@ class RECT(ctypes.Structure):
 
 class MusicPlayer(QWidget):
     # 自定义信号，用于更新UI
+    toggle_play_pause_signal=pyqtSignal()
     update_ui_signal = pyqtSignal(int, int)  # 当前时间(ms)，总时间(ms)
     progress_update_signal = pyqtSignal(int, int)
     # 在非 GUI 线程请求在主线程播放（避免线程直接操作 GUI）
@@ -82,6 +541,14 @@ class MusicPlayer(QWidget):
         self.maxvol=50 #开发用的，可调节
         self.show_flag = 1  # 初始化为显示状态
         self.playorder=0
+        self.current_pos=0
+        self.downloading=False
+        self.send_flag=False
+        self.title=""
+        self.artist=""
+        self.album=""
+        self.connect_other_player=True
+        self.other_player_uri="ws://localhost:11444"#开发用，可调节
         self.myip=socket.gethostbyname(socket.gethostname())
         self.port=random.randint(8000,10000)
         print(f"当前IP地址为：{self.myip}，端口为：{self.port}")
@@ -150,7 +617,7 @@ class MusicPlayer(QWidget):
         self.searching_dlna_devices.timeout.connect(lambda:self.search_dlna_devices(5))
         self.searching_dlna_devices.start(30000)  # 每30s搜索一次dlna设备
         if self.onlinemode==True:#强制开启，调试用
-            self.online_downloader=OnlineDownloader()
+            self.online_downloader=OnlineDownloader(False,self.username,self.password)
             self.playlistid="" #change_there歌单id
             self.trackinfo=TrackInfo()
             self.onlinetrack=self.trackinfo.get_trackinfo(int(self.playlistid))
@@ -165,7 +632,7 @@ class MusicPlayer(QWidget):
         else:
             self.load_music_playlist()
             if self.onlinemode==True:
-                self.online_downloader=OnlineDownloader()
+                self.online_downloader=OnlineDownloader(False)
                 self.trackinfo=TrackInfo()
                 self.onlinetrack=self.trackinfo.get_trackinfo(int(self.playlistid))
                 self.playid=[]
@@ -200,8 +667,15 @@ class MusicPlayer(QWidget):
         self.activateWindow()
         self.start_progress_update()
         
-        # 新增搜索窗口相关
+        self.otherplayer=buildPacketforConnection()
         self.search_window = None
+        if self.connect_other_player:
+            # 使用 QTimer.singleShot 延迟到事件循环启动后创建任务
+            QTimer.singleShot(0, self.start_amll_client)
+        self.toggle_play_pause_signal.connect(self.toggle_play_pause)
+        
+    def start_amll_client(self):
+        self.amll_task = asyncio.create_task(self.amll_client())
     def changeEvent(self, event):
         if event.type() == QEvent.WindowStateChange:
             if self.windowState() & Qt.WindowMinimized:
@@ -359,32 +833,39 @@ class MusicPlayer(QWidget):
         # 1.1 歌曲列表
         self.list_widget = QListWidget(self.left_widget)  # 父对象设为left_widget，确保被其布局管理
         self.list_widget.itemClicked.connect(self.play_selected_song)
+        self.list_widget.setItemDelegate(RippleItemDelegate(self.list_widget))
         left_layout.addWidget(self.list_widget)  # 加入左侧布局
         self.list_widget.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self.list_widget.verticalScrollBar().setSingleStep(10)
 
         # 1.2 按钮区域（水平布局）
         button_layout = QHBoxLayout()
-        self.play_button = QPushButton("播放", self.left_widget)
+        self.play_button = RippleButton("播放", self.left_widget)
         self.play_button.clicked.connect(self.toggle_play_pause)
         button_layout.addWidget(self.play_button)
 
-        self.hide_show_button = QPushButton("隐藏/显示", self.left_widget)
+        self.hide_show_button = RippleButton("隐藏/显示", self.left_widget)
         self.hide_show_button.clicked.connect(self.hide_show_window)
         button_layout.addWidget(self.hide_show_button)
 
-        self.move_button = QPushButton("滚动到当前播放", self.left_widget)
+        self.move_button = RippleButton("滚动到当前播放", self.left_widget)
         self.move_button.clicked.connect(self.to_now_playing)
         button_layout.addWidget(self.move_button)
 
-        self.change_order_button = QPushButton("顺序播放", self.left_widget)
+        self.change_order_button = RippleButton("顺序播放", self.left_widget)
         self.change_order_button.clicked.connect(self.change_play_order)
         button_layout.addWidget(self.change_order_button)
 
-        self.search_button = QPushButton("搜索", self.left_widget)
+        #self.loginbutton=RippleButton("登录", self.left_widget)
+        #self.loginbutton.clicked.connect(self.login)
+        #button_layout.addWidget(self.loginbutton)
+
+        self.search_button = RippleButton("搜索", self.left_widget)
         self.search_button.clicked.connect(self.search)
         button_layout.addWidget(self.search_button)
         left_layout.addLayout(button_layout)  # 按钮布局加入左侧布局
+
+        
 
         # 1.3 进度条区域（水平布局）
         progress_layout = QHBoxLayout()
@@ -406,7 +887,8 @@ class MusicPlayer(QWidget):
 
         
         
-        self.progress_bar = QProgressBar(self.left_widget)
+        self.progress_bar = AnimatedProgressBar(self.left_widget)
+        self.progress_bar.setFixedHeight(6)  # Initial height
         self.progress_bar.setTextVisible(False)
         self.progress_bar.mousePressEvent = self.progress_bar_clicked
         progress_layout.addWidget(self.progress_bar)
@@ -428,6 +910,7 @@ class MusicPlayer(QWidget):
         # 清除歌词视图额外边距，避免顶部留下空白
         self.lyric_view.setContentsMargins(2,0,0,0)
         self.lyric_view.pressed.connect(self.lyric_view_pressed)
+        self.lyric_view.setItemDelegate(RippleItemDelegate(self.lyric_view))
         # 记录歌词基准字号，用于高亮当前行时放大
         base_pt = self.lyric_view.font().pointSize()
         if not base_pt or base_pt <= 0:
@@ -472,6 +955,11 @@ class MusicPlayer(QWidget):
         _main_layout.addWidget(self.splitter)  # 分割器（左侧+歌词）加入主布局
 
         # 关键：无需调用self.setLayout(_main_layout)，因为_main_layout创建时已绑定self
+    def login(self):
+        self.online_downloader.login(self.username)
+        print("验证码已发送")
+        self.verification_code = input("请输入验证码: ")
+        self.online_downloader.verify(self.verification_code)
     def change_play_device(self,index):
         print(index)
         if index==-1:
@@ -497,6 +985,58 @@ class MusicPlayer(QWidget):
                 self._last_soco_transport = self.soco_device.get_current_transport_info().get("current_transport_state")
             except Exception:
                 self._last_soco_transport = None
+    def byte2datauri(self,image_input, mime_type=None) -> str:
+        """
+        将图片文件或二进制数据转换为 Data URI。
+
+        参数：
+            image_input: 图片文件路径 (str 或 Path) 或图片二进制数据 (bytes)
+            mime_type: 可选，手动指定 MIME 类型，如 'image/png'。若为 None 则自动从文件扩展名或图片内容推断。
+
+        返回：
+            str: Data URI 字符串，如 "data:image/jpeg;base64,/9j/4AAQ..."
+
+        抛出：
+            FileNotFoundError: 文件不存在
+            IOError: 读取文件失败
+            ValueError: 无法确定 MIME 类型
+        """
+        # 读取二进制数据
+        img_data = image_input
+
+        # 确定 MIME 类型
+        if mime_type is None:
+            # 尝试通过文件扩展名推断
+            if isinstance(image_input, (str, Path)):
+                ext = os.path.splitext(str(image_input))[1].lower()
+                mime_map = {
+                    '.jpg': 'image/jpeg',
+                    '.jpeg': 'image/jpeg',
+                    '.png': 'image/png',
+                    '.gif': 'image/gif',
+                    '.bmp': 'image/bmp',
+                    '.webp': 'image/webp',
+                }
+                mime_type = mime_map.get(ext)
+            # 如果扩展名无法确定，使用 PIL 检测
+            if mime_type is None:
+                try:
+                    with Image.open(BytesIO(img_data)) as img:
+                        format = img.format
+                        if format:
+                            mime_type = f'image/{format.lower()}'
+                        else:
+                            raise ValueError("无法识别图片格式")
+                except Exception as e:
+                    img = Image.new('RGB', (1, 1), color='black')
+                    buffer = io.BytesIO()
+                    img.save(buffer, format='PNG')
+                    b64 = base64.b64encode(buffer.getvalue()).decode()
+                    data_uri = f"data:image/png;base64,{b64}"
+
+        # Base64 编码
+        b64_data = base64.b64encode(img_data).decode('ascii')
+        return f"data:{mime_type};base64,{b64_data}"
     def update_smtc(self, song_name, artist, cover_bytes):
         self._smtc_updater.type = winsdk.windows.media.MediaPlaybackType.MUSIC
         self._smtc_updater.music_properties.title = song_name
@@ -606,7 +1146,7 @@ class MusicPlayer(QWidget):
                 background-color: {self.bg_color};
                 color: {self.text_color};
                 border: none;
-                border-radius: 5px;
+                border-radius: 12px;
                 font-family: "Microsoft YaHei", "微软雅黑";
                 font-size: 12px;
             }}
@@ -614,7 +1154,7 @@ class MusicPlayer(QWidget):
                 background-color: qlineargradient(x1:0, y1:0 , x2:1 ,y2:0 stop:0 {self.theme_color2} ,stop:1 {self.theme_color});
                 color:{self.text_color};
                 border: none;
-                border-radius: 5px;
+                border-radius: 6px;
             }}
             QListWidget::item:hover {{
                 background-color: rgba(80, 80, 80, 80);
@@ -736,13 +1276,13 @@ class MusicPlayer(QWidget):
                 background-color: {self.bg_color};
                 color: {self.text_color};
                 border: none;
-                border-radius: 3px;
+                border-radius: 12px;
                 padding: 5px;
                 font-family: "Microsoft YaHei", "微软雅黑";
                 font-size: 12px;
             }}
             QPushButton:hover {{
-                background-color: rgba(120, 120, 120, 150);
+                background-color: rgba(120, 120, 120, 80);
             }}
         """
         self.play_button.setStyleSheet(button_style)
@@ -750,6 +1290,19 @@ class MusicPlayer(QWidget):
         self.move_button.setStyleSheet(button_style)
         self.search_button.setStyleSheet(button_style)
         self.change_order_button.setStyleSheet(button_style)
+
+        # Set ripple theme color
+        rgba = self.theme_color.split('(')[1].split(')')[0].replace(' ', '').split(',')
+        theme_qcolor = QColor(int(rgba[0]), int(rgba[1]), int(rgba[2]))
+        self.play_button.set_theme_color(theme_qcolor)
+        self.hide_show_button.set_theme_color(theme_qcolor)
+        self.move_button.set_theme_color(theme_qcolor)
+        self.search_button.set_theme_color(theme_qcolor)
+        self.change_order_button.set_theme_color(theme_qcolor)
+        if hasattr(self, 'list_widget') and self.list_widget.itemDelegate():
+            self.list_widget.itemDelegate().set_theme_color(theme_qcolor)
+        if hasattr(self, 'lyric_view') and self.lyric_view.itemDelegate():
+            self.lyric_view.itemDelegate().set_theme_color(theme_qcolor)
 
         # 标签样式
         label_style = f"""
@@ -768,13 +1321,13 @@ class MusicPlayer(QWidget):
             QProgressBar {{
                 background-color: {self.bg_color};
                 border: none;
-                border-radius: 10px;
+                border-radius: 12px;
                 font-family: "Microsoft YaHei", "微软雅黑";
                 font-size: 12px;
             }}
             QProgressBar::chunk {{
                 background-color: {self.theme_color};
-                border-radius: 10px;
+                border-radius: 12px;
             }}
         """)
 
@@ -892,9 +1445,11 @@ class MusicPlayer(QWidget):
                 playpath = self.cfg.get('music_path', '').strip()
                 self._playpath = playpath
                 try:
-                    self.playlistid = self.cfg.get('playlistid', '').strip()
+                    self.playlistid = self.cfg.get('playlistid', '').strip()  
                     if self.playlistid!="":
                         self.onlinemode=True
+                        self.username = self.cfg.get('username', '').strip()
+                        self.password = self.cfg.get('password', '').strip()
                 except:
                     self.onlinemode=False
                 
@@ -1222,16 +1777,16 @@ class MusicPlayer(QWidget):
             except Exception:
                 return img
     def play_songs(self):
-        global lyrics_lines, lyrics, downloading
+        global lyrics_lines, lyrics
         lyric_list = []
-        
+        #self.toggle_play_pause()
         # 添加线程锁防止并发下载
         if not hasattr(self, 'download_lock'):
             self.download_lock = threading.Lock()
         
         # 使用锁来确保同一时间只有一个下载进行
         with self.download_lock:
-            if downloading:
+            if self.downloading:
                 print(f"下载已在进行中，跳过重复调用")
                 return
             
@@ -1239,6 +1794,7 @@ class MusicPlayer(QWidget):
                 ishaveimg = False
                 self.artist = ""
                 self.title = ""
+                self.album = ""
                 music_folder = self.get_playpath()
                 
                 if self.onlinemode == False:
@@ -1248,7 +1804,7 @@ class MusicPlayer(QWidget):
                         self.current_song = self.current_song_path
                     else:
                         # 直接下载，设置下载标志
-                        downloading = True
+                        self.downloading = True
                         try:
                             print(f"开始下载: {self.playid[self.current_index]}")
                             path, online_lyric = self.online_downloader.download(self.playid[self.current_index])
@@ -1259,10 +1815,10 @@ class MusicPlayer(QWidget):
                         except Exception as e:
                             print(f"下载失败: {e}")
                             self.current_index+=1
-                            downloading = False
+                            self.downloading = False
                             return
                         finally:
-                            downloading = False
+                            self.downloading = False
                 
                 # 其他代码保持不变...
                 lyrics = self.get_lyrics(self.current_song)
@@ -1283,13 +1839,13 @@ class MusicPlayer(QWidget):
                 elif self.current_song.endswith(".flac"):
                     audio = FLAC(self.current_song)
                 
-                album_image_original = None
+                self.album_image_original = None
                 try:
                     for tag in audio.values():
                         if isinstance(tag, APIC):
-                            album_image_original = tag.data
+                            self.album_image_original = tag.data
                             # 处理为 PIL.Image
-                            pil_img = self.process_album_art_fast(album_image_original)
+                            pil_img = self.process_album_art_fast(self.album_image_original)
                             ishaveimg = True
                             try:
                                 # 将 PIL.Image 保存为 PNG 字节，然后由 QPixmap 从数据加载
@@ -1309,9 +1865,9 @@ class MusicPlayer(QWidget):
                                 self.image_label.clear()
                             break
                         if isinstance(tag, Picture):
-                            album_image_original = tag.data
+                            self.album_image_original = tag.data
                             # 处理为 PIL.Image
-                            pil_img = self.process_album_art_fast(album_image_original)
+                            pil_img = self.process_album_art_fast(self.album_image_original)
                             ishaveimg = True
                             try:
                                 # 将 PIL.Image 保存为 PNG 字节，然后由 QPixmap 从数据加载
@@ -1332,11 +1888,10 @@ class MusicPlayer(QWidget):
                             break
                     if not ishaveimg:
                         self.image_label.clear()
-                        album_image_original = None
+                        self.album_image_original = None
                 except:
                     self.image_label.clear()
-                    album_image_original = None
-                
+                    self.album_image_original = None
                 for line in lyric_list:
                     self.lyric_view.addItem(line)
                 
@@ -1350,6 +1905,10 @@ class MusicPlayer(QWidget):
                         pass
                     try:
                         self.artist = "&".join(audio["TPE1"])
+                    except:
+                        pass
+                    try:
+                        self.album=audio["TALB"][0]
                     except:
                         pass
                 
@@ -1390,24 +1949,24 @@ class MusicPlayer(QWidget):
                 else:
                     pygame.mixer.music.load(self.current_song)
                     pygame.mixer.music.play()
-                
                 self.is_playing = True
                 self.play_button.setText("暂停")
                 self.list_widget.setCurrentRow(self.current_index)
                 
-                if album_image_original == None:
-                    album_image_original = b""
+                if self.album_image_original == None:
+                    self.album_image_original = b""
                 
                 try:
-                    self.update_smtc(self.title, self.artist, album_image_original)
+                    self.update_smtc(self.title, self.artist, self.album_image_original)
                 except:
                     pass
                 
                 # 重置音乐时长，让refresh_ui重新计算
                 self.music_long = 0
+                self.send_flag=True
             
             
-    def play_music(self):
+    def play_music(self):#同名函数，方便查找
         global lyric_index
         if not self.playlist:
             return
@@ -1444,8 +2003,8 @@ class MusicPlayer(QWidget):
         # 无播放列表直接返回
         if not self.playlist:
             return
-        print(downloading)
-        if downloading:
+        print(self.downloading)
+        if self.downloading:
             print("！！！！！！！！！！！！！！！！！！！！！！！！！！！！！在下载！！！！！！！！！！！！！！！！！！！！！！")
             return
         # 计算下一首索引
@@ -1713,17 +2272,9 @@ class MusicPlayer(QWidget):
                 current_pos = pygame.mixer.music.get_pos()
                 self.progress_update_signal.emit(current_pos, self.music_long)
                 #print(current_pos,self.music_long,pygame.mixer.music.get_pos(),c,pygame.mixer.music.get_pos()+c)
-                if  self.playlist and self.dlnamode==False and (not downloading) and (pygame.mixer.music.get_pos()+c>=(self.music_long)-100) and self.music_long>0:#防止误差
+                if  self.playlist and self.dlnamode==False and (not self.downloading) and (pygame.mixer.music.get_pos()+c>=(self.music_long)-100) and self.music_long>0:#防止误差
                     self.auto_play_next_song()
                 #少放0.1s应该没有问题吧......
-            if self.dlnamode==True:
-                self.now_time_label.setText("STREAMING")
-                try:
-                    self.total_time_label.setText(f"Vol: {self.soco_device.volume}")
-                except:
-                    self.dlnamode=False
-
-                self.progress_bar.setValue(self.soco_device.volume)
             if self.is_playing and self.dlnamode==True:
                 try:
                     state = self.soco_device.get_current_transport_info().get("current_transport_state")
@@ -1914,12 +2465,23 @@ class MusicPlayer(QWidget):
     def refresh_ui(self):
         global lyric_index, is_scrolling, no_scroll_event
         try:
+            
             if self.is_playing and pygame.mixer.music.get_busy() and self.playlist and not self.dlnamode:
+
                 a = pygame.mixer.music.get_pos()
-                current_pos = a + c
+                self.current_pos = a + c
                 #self.list_widget.setCurrentRow(self.current_index)
-                lyric_index = bisect.bisect_left(lyrics, current_pos) - 1
-                
+                lyric_index = bisect.bisect_left(lyrics, self.current_pos) - 1
+                if self.music_long == 0:
+                    try:
+                        music_folder = self.get_playpath()
+                        if self.onlinemode==False:
+                            self.current_song = os.path.join(music_folder, self.playlist[self.current_index])
+                        audio = pygame.mixer.Sound(self.current_song)
+                        self.music_long = int(audio.get_length() * 1000)
+                        self.update_ui_signal.emit(self.current_pos, self.music_long)
+                    except Exception as e:
+                        print(f"[warn] 获取音乐时长失败: {str(e)}")
                 # 夹取索引范围，避免越界
                 if lyric_index < 0:
                     lyric_index = 0
@@ -1963,13 +2525,19 @@ class MusicPlayer(QWidget):
                     self._last_lyric_index = lyric_index
 
                 # 确保current_pos不超过总时长
-                if self.music_long > 0 and current_pos > self.music_long:
-                    current_pos = self.music_long
+                if self.music_long > 0 and self.current_pos > self.music_long:
+                    self.current_pos = self.music_long
                 
                 # 发送信号到主线程更新UI
-                self.update_ui_signal.emit(current_pos, self.music_long)
+                self.update_ui_signal.emit(self.current_pos, self.music_long)
                 
                 # 首次获取总时长
+                
+            elif self.is_playing and not pygame.mixer.music.get_busy() and not self.dlnamode:
+                # 播放结束但未切换歌曲时，强制更新进度条到100%
+                if self.music_long > 0:
+                    self.update_ui_signal.emit(self.music_long, self.music_long)
+            elif self.is_playing and self.dlnamode:
                 if self.music_long == 0:
                     try:
                         music_folder = self.get_playpath()
@@ -1977,16 +2545,17 @@ class MusicPlayer(QWidget):
                             self.current_song = os.path.join(music_folder, self.playlist[self.current_index])
                         audio = pygame.mixer.Sound(self.current_song)
                         self.music_long = int(audio.get_length() * 1000)
-                        self.update_ui_signal.emit(current_pos, self.music_long)
+                        self.update_ui_signal.emit(self.current_pos, self.music_long)
                     except Exception as e:
                         print(f"[warn] 获取音乐时长失败: {str(e)}")
-            elif self.is_playing and not pygame.mixer.music.get_busy() and not self.dlnamode:
-                # 播放结束但未切换歌曲时，强制更新进度条到100%
-                if self.music_long > 0:
-                    self.update_ui_signal.emit(self.music_long, self.music_long)
-            elif self.is_playing and self.dlnamode:
-                volume = self.soco_device.volume
-                self.update_ui_signal.emit(volume, 10)
+                print(self.soco_device.get_current_track_info()['position'])
+                current_time=self.soco_device.get_current_track_info()['position']
+                h,m,s=current_time.split(":")
+                self.current_pos=int(h)*3600000+int(m)*60000+int(float(s)*1000)
+                self.update_ui_signal.emit(self.current_pos, self.music_long)
+                print(self.current_pos,self.music_long)
+                #volume = self.soco_device.volume
+                #self.update_ui_signal.emit(volume, 10)
 
         except Exception as e:
             print(f"[warn] refresh_ui error: {e}")
@@ -1994,30 +2563,166 @@ class MusicPlayer(QWidget):
     def update_ui_handler(self, current_pos, total_pos):
         global lyric_index
         """主线程中处理UI更新（关键修复：确保此函数被正确调用）"""
-        # 更新当前时间标签
-        if not self.dlnamode:
-            minutes = current_pos // 60000
-            seconds = (current_pos % 60000) // 1000
+        minutes = current_pos // 60000
+        seconds = (current_pos % 60000) // 1000
+        self.now_time_label.setText(f"{minutes:02d}:{seconds:02d}")
+        
+        # 更新进度条
+        if total_pos > 0:
+            self.progress_bar.setMaximum(total_pos)
+            self.progress_bar.setValue(current_pos)
+            self.progress_bar.update() 
+        # 更新总时间标签
+        if total_pos > 0:
+            total_minutes = total_pos // 60000
+            total_seconds = (total_pos % 60000) // 1000
+            self.total_time_label.setText(f"{total_minutes:02d}:{total_seconds:02d}")
+    
+    async def amll_client(self):
+        uri = self.other_player_uri
+        player_lrc_tool=AMLLProtocolHelper()
+        try:
+            print(f"连接到 {uri} ...")
+            async with websockets.connect(uri, ping_interval=None) as websocket:
+                print("连接成功！")
+                send_queue = asyncio.Queue()          # 统一发送队列
 
-            self.now_time_label.setText(f"{minutes:02d}:{seconds:02d}")
-            
+                # ---------- 接收任务 ----------
+                async def receiver():
+                    try:
+                        async for message in websocket:
+                            if isinstance(message, bytes):
+                                # 处理消息，需要回复时把回复消息放入队列
+                                await handle_server_message(message, send_queue)
+                            else:
+                                print(f"收到非二进制消息: {message}")
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        print(f"接收出错: {e}")
+                        traceback.print_exc()
 
+                # ---------- 发送任务：从队列取消息并发送 ----------
+                async def sender():
+                    try:
+                        while True:
+                            msg = await send_queue.get()   # 阻塞直到有消息
+                            await websocket.send(msg)
+                            send_queue.task_done()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        print(f"发送任务出错: {e}")
 
-            # 更新进度条
-            if total_pos > 0:
-                self.progress_bar.setMaximum(total_pos)
-                self.progress_bar.setValue(current_pos)
-                self.progress_bar.update() 
-            # 更新总时间标签
-            if total_pos > 0:
-                total_minutes = total_pos // 60000
-                total_seconds = (total_pos % 60000) // 1000
-                self.total_time_label.setText(f"{total_minutes:02d}:{total_seconds:02d}")
-        if self.dlnamode:
-            self.progress_bar.setMaximum(100)
-            self.progress_bar.setValue(self.soco_device.volume)
-            self.progress_bar.update()
+                # ---------- 轮询检测 send_flag 的任务 ----------
+                async def flag_checker(): 
+                    try:
+                        while True:
+                            if self.send_flag:
+                                    # 构建音乐信息（根据您的实际属性）
+                                    artist_list = []
+                                    try:
+                                        artists = self.artist.split("&")
+                                        for artist_id, name in enumerate(artists):
+                                            artist_list.append({"id": f"artist{artist_id}", "name": name})
+                                    except:
+                                        artist_list = [{"id": "artist0", "name": "未知歌手"}]
+                                    print(self.music_long)
+                                    await asyncio.sleep(0.8) 
+                                    music_info = self.otherplayer.build_set_music_info(
+                                        music_id="song",
+                                        music_name=self.title,
+                                        album_id="album",
+                                        album_name=self.album,
+                                        artists=artist_list,
+                                        duration=self.music_long
+                                    )
+                                    await send_queue.put(music_info)   # 放入队列，由 sender 发送
+                                    await send_queue.put(self.otherplayer.build_message(MAGIC["SetMusicAlbumCoverImageURI"],self.otherplayer.build_nullstring(self.byte2datauri(self.album_image_original))))
+                                    await send_queue.put(player_lrc_tool.convert_lrc_to_set_lyric(self.get_lyrics(self.current_song),use_pseudo_words=False))
+                                    self.send_flag = False
+                            await send_queue.put(self.otherplayer.build_on_play_progress(self.current_pos))
+                            if self.is_playing:
+                                await send_queue.put(self.otherplayer.build_on_resumed())
+                            else:
+                                await send_queue.put(self.otherplayer.build_on_paused())
+                            await asyncio.sleep(0.1)   # 轮询间隔，避免 CPU 空转
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        traceback.print_exc()
 
+                # ---------- 处理服务器消息（使用队列发送回复） ----------
+                async def handle_server_message(data: bytes, queue: asyncio.Queue):
+                    if len(data) < 2:
+                        print("消息太短")
+                        return
+                    magic = struct.unpack_from('<H', data, 0)[0]
+                    msg_type = REVERSE_MAGIC.get(magic, f"未知({magic})")
+                    print(f"📩 收到服务器消息: {msg_type}")
+
+                    if magic == MAGIC["Ping"]:
+                        # 将 Pong 放入队列，不直接发送
+                        pong = self.otherplayer.build_pong()
+                        await queue.put(pong)
+                        print("📤 自动回复 Pong 已入队")
+                    elif magic == MAGIC["Pause"]:
+                        print("  服务器要求暂停")
+                        self.toggle_play_pause_signal.emit()
+                    elif magic == MAGIC["Resume"]:
+                        print("  服务器要求恢复")
+                        self.toggle_play_pause_signal.emit()
+                    elif magic == MAGIC["ForwardSong"]:
+                        print("  服务器要求下一曲")
+                        self.next_song()
+                    elif magic == MAGIC["BackwardSong"]:
+                        print("  服务器要求上一曲")
+                        self.prev_song()
+                    elif magic == MAGIC["SetVolume"]:
+                        volume = struct.unpack_from('<d', data, 2)[0]
+                        print(f"  服务器设置音量: {volume}")
+                    elif magic == MAGIC["SeekPlayProgress"]:
+                        progress = struct.unpack_from('<Q', data, 2)[0]
+                        print(f"  服务器设置进度: {progress}ms")
+                        self.progress_bar_clicked(event=None,pos=progress)
+                    # 其他消息可忽略或按需处理
+
+                # 启动三个任务
+                receiver_task = asyncio.create_task(receiver())
+                sender_task = asyncio.create_task(sender())
+                checker_task = asyncio.create_task(flag_checker())
+
+                # 如果需要连接后立即发送一次音乐信息，可以手动设置标志或直接放入队列
+                # 这里演示直接放入队列（无需经过 flag_checker）
+                # 如果您希望由 send_flag 触发，则注释掉下面这段，在适当地方设置 self.send_flag = True
+                # 为兼容原有逻辑，我们可以在启动后立即放入一次（但不影响 flag_checker 后续检测）
+                artist_list = []
+                try:
+                    artists = self.artist.split("&")
+                    for artist_id, name in enumerate(artists):
+                        artist_list.append({"id": f"artist{artist_id}", "name": name})
+                except:
+                    artist_list = [{"id": "artist0", "name": "未知歌手"}]
+                await asyncio.sleep(0.2)   # 轮询间隔，避免 CPU 空转
+                music_info = self.otherplayer.build_set_music_info(
+                    music_id="song",
+                    music_name=self.title,
+                    album_id="album",
+                    album_name=self.album,
+                    artists=artist_list,
+                    duration=self.music_long
+                )
+                await send_queue.put(music_info)   # 立即发送一次
+
+                # 等待所有任务完成（通常不会，除非连接关闭或出错）
+                await asyncio.gather(receiver_task, sender_task, checker_task)
+
+        except websockets.exceptions.ConnectionClosedOK:
+            print("连接安全关闭")
+        except ConnectionRefusedError:
+            print("❌ 连接被拒绝，请确保服务器正在运行")
+        except Exception as e:
+            print(f"❌ 错误: {type(e).__name__}: {e}")
     def closeEvent(self, event):
         """窗口关闭时清理资源"""
         self.quit_flag = 1
@@ -2035,28 +2740,44 @@ class MusicPlayer(QWidget):
             json.dump(self.cfg,f)"""
         event.accept()
 
-    def progress_bar_clicked(self, event):
+    def progress_bar_clicked(self, event,pos=-1):
         # 计算点击位置对应的音乐时间
         global c
-        if not self.dlnamode:
-            if self.music_long <= 0:
-                return
-                
+        if self.music_long <= 0:
+            return
+        if pos==-1:
             width = self.progress_bar.width()
             x = event.x()
             ratio = x / width
             target_time = int(self.music_long * ratio)
-            c = target_time - pygame.mixer.music.get_pos()
-            
-            try:
-                # 设置音乐播放位置（毫秒转换为秒）
-                pygame.mixer.music.set_pos(target_time / 1000.0)
-                
-                # 立即更新UI
-                self.update_ui_signal.emit(target_time + c, self.music_long)
-            except Exception as e:
-                print(f"设置播放位置失败: {str(e)}")
+        if not self.dlnamode:
+            if pos==-1:
+                c = target_time - pygame.mixer.music.get_pos()
+            else:
+                c = pos-pygame.mixer.music.get_pos()
+                target_time=pos
         else:
+            c=0
+        
+        try:
+            # 设置音乐播放位置（毫秒转换为秒）
+            if not self.dlnamode:
+                pygame.mixer.music.set_pos(target_time / 1000.0)
+            else:
+                h=target_time//3600000
+                m=(target_time%3600000)//60000
+                s=(target_time%60000)//1000
+                hh=str(h).zfill(2)
+                mm=str(m).zfill(2)
+                ss=str(s).zfill(2)
+                self.soco_device.seek(f"{hh}:{mm}:{ss}")
+            
+            # 立即更新UI
+            self.update_ui_signal.emit(target_time + c, self.music_long)
+        except Exception as e:
+            print(f"设置播放位置失败: {str(e)}")
+        #old version:
+        """else:
             width = self.progress_bar.width()
             x = event.x()
             ratio = x / width
@@ -2070,7 +2791,7 @@ class MusicPlayer(QWidget):
                 ret = msg.exec_()
                 if ret == QMessageBox.No:
                     return
-            self.soco_device.volume=volume
+            self.soco_device.volume=volume"""
     def next_item(self):
         if self.search_result==[]:
             return 
@@ -2104,11 +2825,11 @@ class SearchWindow(QWidget):
         layout.addLayout(h_layout)
         
         # 创建搜索按钮
-        self.search_button = QPushButton("搜索")
+        self.search_button = RippleButton("搜索")
         self.search_button.clicked.connect(self.perform_search)
         h_layout.addWidget(self.search_button)
 
-        self.close_button = QPushButton("关闭")
+        self.close_button = RippleButton("关闭")
         self.close_button.clicked.connect(self.close)
         h_layout.addWidget(self.close_button)
 
@@ -2116,7 +2837,7 @@ class SearchWindow(QWidget):
         layout.addWidget(self.iscap_checkbox)
         self.iscap_checkbox.setChecked(True)
 
-        self.next_item_button = QPushButton("下一个")
+        self.next_item_button = RippleButton("下一个")
         self.next_item_button.clicked.connect(self.next_item)
         h_layout.addWidget(self.next_item_button)
         
@@ -2172,6 +2893,14 @@ class SearchWindow(QWidget):
         self.close_button.setStyleSheet(button_style)
         self.next_item_button.setStyleSheet(button_style)
         
+        # Set ripple theme color
+        if self.parent_player and hasattr(self.parent_player, 'theme_color'):
+            rgba = self.parent_player.theme_color.split('(')[1].split(')')[0].replace(' ', '').split(',')
+            theme_qcolor = QColor(int(rgba[0]), int(rgba[1]), int(rgba[2]))
+            self.search_button.set_theme_color(theme_qcolor)
+            self.close_button.set_theme_color(theme_qcolor)
+            self.next_item_button.set_theme_color(theme_qcolor)
+        
         # 设置复选框样式
         self.iscap_checkbox.setStyleSheet(f"""
             QCheckBox {{
@@ -2219,5 +2948,8 @@ if __name__ == "__main__":
     matplotlib.rcParams["font.family"] = ["consolas","SimHei", "WenQuanYi Micro Hei", "Heiti TC"]
     
     app = QApplication(sys.argv)
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
     player = MusicPlayer()
-    sys.exit(app.exec_())
+    with loop:
+        loop.run_forever()

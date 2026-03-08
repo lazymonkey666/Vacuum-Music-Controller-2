@@ -1,13 +1,13 @@
 import os
 import requests
 import time
-from pyncm import apis
+import pyncm.apis.login
 from mutagen.mp3 import EasyMP3
 from mutagen.id3 import ID3, APIC, USLT
 import threading
 
 class OnlineDownloader:
-    def __init__(self, enable_api=True):
+    def __init__(self, enable_api):#修改
         # 初始化配置
         self.download_dir =  os.path.expanduser("~") + "\\AppData\\Roaming\\Vacuum\\Vacuum_Music_Player\\downloads\\songs"
         self.cover_dir =  os.path.expanduser("~") + "\\AppData\\Roaming\\Vacuum\\Vacuum_Music_Player\\downloads\\covers"
@@ -23,11 +23,30 @@ class OnlineDownloader:
         }
         # 是否启用第三方API下载VIP歌曲
         self.enable_api = enable_api
-        # 匿名登录
-        apis.login.LoginViaAnonymousAccount()
+        # 若不是登陆账号那么匿名登录
+        pyncm.apis.login.LoginViaAnonymousAccount()
         # 创建目录
         self._create_directories()
-
+    def verify(self,verification_code):
+        try:
+            pyncm.apis.login.LoginViaCellphone(cell=self.usercellphone,captcha=verification_code)
+        except Exception as e:
+            print(e)
+            return False
+    def login(self,usercellphone):
+        try:
+            int(usercellphone)
+        except:
+            return False
+        if usercellphone=="" or len(usercellphone)!=11 or int(usercellphone)<0 or usercellphone[0]!="1" :
+            try:
+                pyncm.apis.login.SetSendRegisterVerifcationCodeViaCellphone(cell=usercellphone)
+                self.usercellphone=usercellphone
+            except Exception as e:
+                print(e)
+                return False
+        else:
+            return False
     def _create_directories(self):
         """创建下载目录"""
         for dir_path in [self.download_dir, self.cover_dir]:
@@ -86,7 +105,7 @@ class OnlineDownloader:
 
     def _get_track_audio(self, track_id):
         """获取普通歌曲音频信息"""
-        return apis.track.GetTrackAudio(track_id)
+        return pyncm.apis.track.GetTrackAudio(track_id)
 
     def _process_track_tags(self, song_detail, track_id):
         """处理歌曲标签信息"""
